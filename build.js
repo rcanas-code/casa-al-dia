@@ -4,6 +4,7 @@ const path = require('path');
 const src = (f) => fs.readFileSync(path.join(__dirname, 'src', f), 'utf8');
 const html = src('index.html')
   .replace('/*STYLE*/', () => src('styles.css'))
+  .replace('/*VENDOR*/', () => '/* @zxing/library 0.23.0 — Apache License 2.0 — https://github.com/zxing-js/library */\n' + src('vendor/zxing.min.js'))
   .replace('/*LOGIC*/', () => src('logic.js'))
   .replace('/*APP*/', () => src('app.js'));
 fs.mkdirSync(path.join(__dirname, 'dist'), { recursive: true });

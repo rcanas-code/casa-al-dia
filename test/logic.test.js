@@ -173,3 +173,25 @@ test('validación de respaldo', () => {
   assert.equal(ok.ok, true);
   assert.equal(ok.counts.products, 1);
 });
+
+test('códigos de barras: dígito de control', () => {
+  assert.equal(L.cleanBarcode('4 006381 333931'), '4006381333931'); // espacios ignorados
+  assert.equal(L.cleanBarcode('4006381333931'), '4006381333931'); // EAN-13 válido
+  assert.equal(L.cleanBarcode('4006381333932'), null); // control incorrecto
+  assert.equal(L.cleanBarcode('96385074'), '96385074'); // EAN-8
+  assert.equal(L.cleanBarcode('123'), null);
+});
+
+test('Open Food Facts: solo usa datos presentes, sin inventar', () => {
+  assert.deepEqual(L.parseQuantityText('1,5 L'), { size: 1.5, unit: 'l' });
+  assert.deepEqual(L.parseQuantityText('33 cl'), { size: 330, unit: 'ml' });
+  assert.deepEqual(L.parseQuantityText('500 g'), { size: 500, unit: 'g' });
+  assert.equal(L.parseQuantityText('6 x 1 l'), null);
+  assert.equal(L.parseQuantityText('aprox. mucho'), null);
+  const r = L.parseOFF({ status: 1, product: { product_name_es: 'Leche entera', brands: 'Hacendado, Mercadona', quantity: '1 l' } });
+  assert.deepEqual({ ...r, quantityText: undefined }, { name: 'Leche entera', brand: 'Hacendado', size: 1, unit: 'l', quantityText: undefined });
+  const r2 = L.parseOFF({ status: 1, product: { product_name: 'Galletas', quantity: '4 x 200 g', product_quantity: 800, product_quantity_unit: 'g' } });
+  assert.equal(r2.size, 800);
+  assert.equal(L.parseOFF({ status: 1, product: { quantity: '6 x 1 l' } }), null);
+  assert.equal(L.parseOFF({ status: 0 }), null);
+});

@@ -246,7 +246,7 @@
   function renderProductos() {
     var q = ui.search.toLowerCase();
     var list = S.products.filter(function (p) { return !!p.archived === ui.showArchivedP; })
-      .filter(function (p) { return !q || (p.name + ' ' + (p.brand || '') + ' ' + (p.category || '')).toLowerCase().indexOf(q) >= 0; })
+      .filter(function (p) { return !q || (p.name + ' ' + (p.brand || '') + ' ' + (p.category || '') + ' ' + (p.barcode || '')).toLowerCase().indexOf(q) >= 0; })
       .sort(function (a, b) {
         var ea = L.estimate(a, today()), eb = L.estimate(b, today());
         var da = ea.status === 'ok' ? ea.daysLeft : 1e6, dbb = eb.status === 'ok' ? eb.daysLeft : 1e6;
@@ -271,6 +271,7 @@
     h += '<div class="card"><div class="title" style="font-size:20px;font-weight:700">' + esc(p.name) + ' ' + demoChip(p) + (p.archived ? ' <span class="chip">Archivado</span>' : '') + '</div>';
     h += '<div class="muted">' + esc([p.brand, p.category].filter(Boolean).join(' · ')) + '</div>';
     h += '<div>Envase: <b>' + (L.validSize(p.size, p.unit) ? L.sizeLabel(p.size, p.unit) : '<span class="muted">sin indicar</span>') + '</b></div>';
+    if (p.barcode) h += '<div class="small muted">Código de barras: ' + esc(p.barcode) + '</div>';
     if (safeUrl(p.url)) h += '<div><a href="' + esc(p.url) + '" target="_blank" rel="noopener">Abrir enlace de compra ↗</a></div>';
     h += '</div>';
     h += '<div class="section-title">Existencias</div>' + estimateBox(p);
@@ -298,10 +299,120 @@
     h += '<div class="btns"><button class="btn" data-act="product-edit" data-id="' + p.id + '">Editar</button><button class="btn" data-act="product-archive" data-id="' + p.id + '">' + (p.archived ? 'Desarchivar' : 'Archivar') + '</button><button class="btn danger" data-act="product-delete" data-id="' + p.id + '">Eliminar</button></div>';
     openSheet('Producto', h);
   }
-  function productForm(id) {
-    var p = id ? byId('products', id) : { name: '', brand: '', category: '', size: null, unit: 'kg', url: '' };
+  // ---------- Código de barras ----------
+  function loadImageFile(file) {
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () { res({ img: img, url: url }); };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('No se pudo leer la imagen')); };
+      img.src = url;
+    });
+  }
+  /** Lee un EAN/UPC de una foto. Prueba varios tamaños y giros. No usa internet. */
+  function decodeBarcode(file) {
+    var Z = window.ZXing;
+    if (!Z) return Promise.reject(new Error('El lector de códigos no está disponible'));
+    return loadImageFile(file).then(function (o) {
+      var hints = new Map();
+      hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E]);
+      hints.set(Z.DecodeHintType.TRY_HARDER, true);
+      var reader = new Z.MultiFormatReader(); reader.setHints(hints);
+      var found = null, W = o.img.naturalWidth, H = o.img.naturalHeight, t0 = Date.now();
+      // Intentos ordenados de más probable a menos: foto entera y recortes centrales, varias resoluciones y giros.
+      var regions = [[0, 0, 1], [0.2, 0.2, 0.6], [0.1, 0.25, 0.8]];
+      var attempts = [];
+      regions.forEach(function (rg) {
+        [1400, 900, 2200].forEach(function (max) { [0, -10, 10, 90, -20, 20].forEach(function (rot) { attempts.push([rg, max, rot]); }); });
+      });
+      attempts.sort(function (a, b) { return Math.abs(a[2] % 90) - Math.abs(b[2] % 90); });
+      attempts.some(function (at) {
+        if (Date.now() - t0 > 5000) return true; // límite de tiempo
+        var rg = at[0], max = at[1], rot = at[2];
+        var sx = W * rg[0], sy = H * rg[1], sw = W * rg[2], sh = H * (rg === regions[2] ? 0.5 : rg[2]);
+        var k = Math.min(1, max / Math.max(sw, sh)), cw = Math.round(sw * k), ch = Math.round(sh * k);
+        var rad = rot * Math.PI / 180, cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+        var c = document.createElement('canvas'), g = c.getContext('2d');
+        c.width = Math.round(cw * cos + ch * sin); c.height = Math.round(cw * sin + ch * cos);
+        g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+        g.translate(c.width / 2, c.height / 2); g.rotate(rad);
+        g.drawImage(o.img, sx, sy, sw, sh, -cw / 2, -ch / 2, cw, ch);
+        try {
+          var bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(c)));
+          found = L.cleanBarcode(reader.decode(bmp).getText());
+        } catch (e) { found = null; } finally { reader.reset(); }
+        return !!found;
+      });
+      URL.revokeObjectURL(o.url);
+      if (!found) throw new Error('No se ha podido leer el código. Acerca el móvil, evita reflejos y que salgan todas las barras');
+      return found;
+    });
+  }
+  /** Consulta Open Food Facts (base de datos pública y gratuita). Devuelve propuesta, 'notfound' o lanza error. */
+  function lookupOFF(code) {
+    var ctrl = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 9000);
+    return fetch('https://world.openfoodfacts.org/api/v2/product/' + code + '.json?fields=product_name,product_name_es,brands,quantity,product_quantity,product_quantity_unit', ctrl ? { signal: ctrl.signal } : {})
+      .then(function (r) {
+        if (r.status === 404) return 'notfound';
+        if (!r.ok) throw new Error('respuesta ' + r.status);
+        return r.json().then(function (j) { return L.parseOFF(j) || 'notfound'; });
+      })
+      .finally(function () { clearTimeout(timer); });
+  }
+  function productByBarcode(code, exceptId) {
+    return S.products.find(function (p) { return p.barcode === code && p.id !== exceptId; }) || null;
+  }
+  var offSuggestion = null;
+  function onProductBarcode(form, file) {
+    var out = $('#barcode-result');
+    out.innerHTML = '<p class="small muted">Leyendo el código…</p>';
+    decodeBarcode(file).then(function (code) {
+      form.barcode.value = code;
+      var other = productByBarcode(code, form.dataset.id);
+      if (other) {
+        out.innerHTML = '<div class="estimate warn">Código ' + code + ': ya lo tienes como <b>' + esc(other.name) + '</b>. <button type="button" class="link-btn" data-act="product-open" data-id="' + other.id + '">Abrir ese producto</button></div>';
+        return;
+      }
+      out.innerHTML = '<p class="small muted">Código ' + code + ' leído. Buscando datos en Open Food Facts…</p>';
+      return lookupOFF(code).then(function (r) {
+        if (r === 'notfound') {
+          out.innerHTML = '<div class="estimate">Código <b>' + code + '</b> leído. No aparece en Open Food Facts: rellena los datos a mano. El código se guardará para reconocerlo la próxima vez.</div>';
+          return;
+        }
+        offSuggestion = r;
+        out.innerHTML = '<div class="estimate"><div class="small muted">Datos encontrados en Open Food Facts (base pública, puede tener errores). Revísalos:</div>' +
+          '<div><b>' + esc(r.name || '—') + '</b></div><div>Marca: ' + esc(r.brand || '—') + '</div><div>Contenido: ' + (r.size ? L.sizeLabel(r.size, r.unit) : '<span class="muted">no indicado' + (r.quantityText ? ' («' + esc(r.quantityText) + '»)' : '') + '</span>') + '</div>' +
+          '<div class="btns"><button type="button" class="btn primary" data-act="off-apply">Usar estos datos</button><button type="button" class="btn" data-act="off-dismiss">No, gracias</button></div></div>';
+      }, function () {
+        out.innerHTML = '<div class="estimate warn">Código <b>' + code + '</b> leído, pero no se ha podido consultar Open Food Facts (sin conexión o no permitido en esta versión). Rellena los datos a mano; el código quedará guardado.</div>';
+      });
+    }).catch(function (e) { out.innerHTML = '<div class="form-error">' + esc(e.message) + '. También puedes escribir el número debajo de las barras.</div>'; });
+  }
+  function onPriceBarcode(form, file) {
+    var out = $('#barcode-result');
+    out.innerHTML = '<p class="small muted">Leyendo el código…</p>';
+    decodeBarcode(file).then(function (code) {
+      var p = productByBarcode(code);
+      if (!p || p.archived) {
+        out.innerHTML = '<div class="estimate warn">Código <b>' + code + '</b>: no tienes ningún producto ' + (p ? 'activo ' : '') + 'con este código. <button type="button" class="link-btn" data-act="product-new-barcode" data-id="' + code + '">Crear producto</button></div>';
+        return;
+      }
+      form.productId.value = p.id; form.size.value = numToInput(p.size); form.unit.value = p.unit;
+      updateUnitPreview(form);
+      out.innerHTML = '<div class="estimate">Producto: <b>' + esc(p.name) + '</b>. Escribe el precio.</div>';
+      form.price.focus();
+    }).catch(function (e) { out.innerHTML = '<div class="form-error">' + esc(e.message) + '.</div>'; });
+  }
+  function barcodeButton() {
+    return '<label class="btn block" style="text-align:center">▮▯▮ Escanear código de barras<input type="file" accept="image/*" capture="environment" id="barcode-input" hidden></label><div class="hint">Acerca el móvil para que el código ocupe casi toda la foto, recto y sin reflejos.</div><div id="barcode-result"></div>';
+  }
+
+  function productForm(id, prefill) {
+    var p = id ? byId('products', id) : Object.assign({ name: '', brand: '', category: '', size: null, unit: 'kg', url: '', barcode: '' }, prefill || {});
+    offSuggestion = null;
     var cats = CATEGORIES.concat(S.products.map(function (x) { return x.category; })).filter(function (c, i, a) { return c && a.indexOf(c) === i; });
     var h = '<form data-form="product" data-id="' + (id || '') + '" novalidate>';
+    h += '<div class="field"><span class="label">Código de barras (opcional)</span>' + barcodeButton() + '<input name="barcode" value="' + esc(p.barcode || '') + '" inputmode="numeric" autocomplete="off" placeholder="O escribe los números de debajo de las barras" style="margin-top:6px"><div class="hint">Si el producto está en Open Food Facts, te propone nombre, marca y contenido. Tú decides si usarlos.</div></div>';
     h += '<div class="field"><span class="label">Foto (opcional)</span><div id="photo-preview">' + (p.photoId && photos[p.photoId] ? '<img class="photo-big" src="' + photos[p.photoId] + '" alt="">' : '') + '</div>';
     h += '<label class="btn block" style="text-align:center">📷 Hacer foto o elegir de la galería<input type="file" accept="image/*" name="photo" id="photo-input" hidden></label>';
     h += '<input type="hidden" name="photoAction" value="keep">' + (p.photoId ? '<button type="button" class="link-btn" style="color:var(--danger)" data-act="photo-remove">Quitar foto</button>' : '');
@@ -335,8 +446,15 @@
     var size = f.size ? L.parseNum(f.size) : null;
     if (f.size && (size === null || size <= 0)) return formError(form, 'El contenido del envase debe ser un número mayor que 0 (ej.: 1,5).');
     if (f.url && !safeUrl(f.url)) return formError(form, 'El enlace debe empezar por https:// o http://');
+    var barcode = null;
+    if (f.barcode) {
+      barcode = L.cleanBarcode(f.barcode);
+      if (!barcode) return formError(form, 'El código de barras no es válido (revisa los números).');
+      var dupB = productByBarcode(barcode, id);
+      if (dupB) return formError(form, 'Ese código ya está en «' + dupB.name + '».');
+    }
     var p = id ? Object.assign({}, byId('products', id)) : { id: uid(), createdAt: Date.now(), stock: { mode: 'none', reserves: 0 } };
-    Object.assign(p, { name: f.name, brand: f.brand, category: f.category, size: size, unit: f.unit, url: f.url });
+    Object.assign(p, { name: f.name, brand: f.brand, category: f.category, size: size, unit: f.unit, url: f.url, barcode: barcode });
     var ops = [];
     if (f.photoAction === 'new' && pendingPhoto) {
       if (p.photoId) ops.push(delPhoto(p.photoId));
@@ -463,6 +581,7 @@
     var h = '<form data-form="price" novalidate><p class="small muted">Guarda lo que ves en la tienda. Registrar un precio no suma existencias. Al guardar y añadir otro se mantienen la tienda y la fecha.</p>';
     h += field('Tienda', (S.stores.length ? sel('storeId', S.stores.map(function (s) { return [s.id, s.name]; }).concat([['__new', '＋ Nueva tienda…']]), ui.lastStoreId || S.stores[0].id) : sel('storeId', [['__new', '＋ Nueva tienda…']], '__new')) +
       '<input name="newStore" placeholder="Nombre de la nueva tienda" style="margin-top:6px"' + (S.stores.length ? ' hidden' : '') + '>');
+    h += '<div class="field">' + barcodeButton() + '</div>';
     h += field('Producto', sel('productId', [['', 'Elige…']].concat(prods.map(function (x) { return [x.id, x.name + (x.brand ? ' · ' + x.brand : '')]; })), p ? p.id : ''));
     h += '<div class="two">' + field('Contenido del envase', numInp('size', p ? numToInput(p.size) : '')) + field('Unidad', sel('unit', UNIT_OPTS, p ? p.unit : 'kg')) + '</div>';
     h += '<div class="two">' + field('Precio del envase (€)', numInp('price', '', 'placeholder="0,00"')) + field('Fecha observada', inp('date', ui.lastPriceDate || today(), 'type="date"')) + '</div>';
@@ -842,6 +961,16 @@
       openSheet('Añadir', '<button class="btn primary block" data-act="product-new">📦 Producto</button><button class="btn primary block" data-act="renewal-new">↻ Renovación, seguro o suscripción</button><button class="btn block" data-act="price-new">€ Precio de una tienda</button><button class="btn block" data-act="list-add">🛒 Algo a la lista de compra</button>');
     },
     'product-new': function () { productForm(); },
+    'product-new-barcode': function (code) { productForm(null, { barcode: code }); },
+    'off-apply': function () {
+      var f = $('form[data-form=product]'), r = offSuggestion; if (!f || !r) return;
+      if (r.name) f.name.value = r.name;
+      if (r.brand) f.brand.value = r.brand;
+      if (r.size) { f.size.value = numToInput(r.size); f.unit.value = r.unit; }
+      $('#barcode-result').innerHTML = '<p class="small muted">Datos copiados al formulario. Revísalos y corrige lo que haga falta antes de guardar.</p>';
+      offSuggestion = null;
+    },
+    'off-dismiss': function () { offSuggestion = null; $('#barcode-result').innerHTML = ''; },
     'product-open': function (id) { productDetail(id); },
     'product-edit': function (id) { productForm(id); },
     'product-archive': function (id) { var p = byId('products', id); update('products', id, { archived: !p.archived }).then(function () { toast(p.archived ? 'Desarchivado' : 'Archivado'); render(); productDetail(id); }); },
@@ -933,6 +1062,10 @@
         pendingPhoto = data; form.photoAction.value = 'new';
         $('#photo-preview').innerHTML = '<img class="photo-big" src="' + data + '" alt=""><div class="small muted">Foto lista (' + Math.round(data.length * 0.75 / 1024) + ' KB). Se guardará con el producto.</div>';
       }).catch(function (err) { $('#photo-preview').innerHTML = '<p class="form-error">' + esc(err.message) + '. Puedes guardar el producto sin foto.</p>'; });
+    }
+    if (t.id === 'barcode-input' && t.files && t.files[0]) {
+      var bf = t.form, file = t.files[0]; t.value = '';
+      return bf.dataset.form === 'price' ? onPriceBarcode(bf, file) : onProductBarcode(bf, file);
     }
     if (t.id === 'import-input' && t.files && t.files[0]) { importBackup(t.files[0]); t.value = ''; return; }
     if (t.id === 'withPrice') { $('#price-extra').hidden = !t.checked; return; }

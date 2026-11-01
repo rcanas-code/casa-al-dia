@@ -378,7 +378,47 @@
     return { ok: errors.length === 0, errors: errors.slice(0, 8), counts: counts };
   }
 
+  // ---------- Códigos de barras y Open Food Facts ----------
+  /** Deja solo dígitos; devuelve el código si tiene una longitud EAN/UPC válida y su dígito de control cuadra. */
+  function cleanBarcode(s) {
+    var c = String(s || '').replace(/\D/g, '');
+    if ([8, 12, 13, 14].indexOf(c.length) < 0) return null;
+    var digits = c.split('').map(Number), check = digits.pop(), sum = 0;
+    digits.reverse().forEach(function (d, i) { sum += d * (i % 2 === 0 ? 3 : 1); });
+    return (10 - (sum % 10)) % 10 === check ? c : null;
+  }
+  /** Interpreta '1 kg', '750 ml', '1,5 L', '33 cl'. Packs tipo '6 x 1 l' no se interpretan (no se inventa). */
+  function parseQuantityText(q) {
+    var s = String(q || '').trim().toLowerCase();
+    if (!s || /\d\s*[x×*]\s*\d/.test(s)) return null;
+    var m = /^(\d+(?:[.,]\d+)?)\s*(kg|kilos?|g|gr|grs|gramos|l|litros?|cl|ml|ud|uds|u|unidades)\b\.?\s*$/.exec(s);
+    if (!m) return null;
+    var n = Number(m[1].replace(',', '.'));
+    if (!(n > 0)) return null;
+    var u = m[2];
+    if (/^k/.test(u)) return { size: n, unit: 'kg' };
+    if (/^g/.test(u)) return { size: n, unit: 'g' };
+    if (u === 'cl') return { size: Math.round(n * 10 * 1000) / 1000, unit: 'ml' };
+    if (u === 'ml') return { size: n, unit: 'ml' };
+    if (/^l/.test(u)) return { size: n, unit: 'l' };
+    return { size: n, unit: 'ud' };
+  }
+  /** Convierte la respuesta de Open Food Facts en una propuesta. Solo campos presentes; nada se deduce. */
+  function parseOFF(json) {
+    if (!json || json.status !== 1 || !json.product) return null;
+    var p = json.product;
+    var name = String(p.product_name_es || p.product_name || '').trim();
+    var brand = String(p.brands || '').split(',')[0].trim();
+    var qty = parseQuantityText(p.quantity);
+    if (!qty && Number(p.product_quantity) > 0 && /^(g|ml)$/i.test(p.product_quantity_unit || '')) {
+      qty = { size: Number(p.product_quantity), unit: p.product_quantity_unit.toLowerCase() };
+    }
+    if (!name && !brand && !qty) return null;
+    return { name: name, brand: brand, size: qty ? qty.size : null, unit: qty ? qty.unit : null, quantityText: String(p.quantity || '') };
+  }
+
   var api = {
+    cleanBarcode: cleanBarcode, parseQuantityText: parseQuantityText, parseOFF: parseOFF,
     TZ: TZ, todayISO: todayISO, isISODate: isISODate, addDays: addDays, diffDays: diffDays, addMonths: addMonths,
     nextChargeDate: nextChargeDate, annualCostCents: annualCostCents, formatDate: formatDate, relDays: relDays,
     parseNum: parseNum, parseMoney: parseMoney, formatMoney: formatMoney, centsToInput: centsToInput, fmtNum: fmtNum,
