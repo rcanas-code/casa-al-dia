@@ -1,0 +1,11 @@
+# Netlify: no hace falta compilar; se publica la carpeta dist tal cual.
+[build]
+  publish = "dist"
+  command = ""
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "geolocation=(), microphone=()"

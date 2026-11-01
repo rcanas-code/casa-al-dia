@@ -9,4 +9,6 @@ const html = src('index.html')
   .replace('/*APP*/', () => src('app.js'));
 fs.mkdirSync(path.join(__dirname, 'dist'), { recursive: true });
 fs.writeFileSync(path.join(__dirname, 'dist', 'casa-al-dia.html'), html);
+// Copia para alojamientos web (Netlify, GitHub Pages), que sirven index.html
+fs.writeFileSync(path.join(__dirname, 'dist', 'index.html'), html);
 console.log('dist/casa-al-dia.html', Math.round(html.length / 1024) + ' KB');
