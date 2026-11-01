@@ -1,0 +1,998 @@
+/* Casa al día — interfaz. Datos en IndexedDB del navegador. */
+(function () {
+  'use strict';
+  var L = window.Logic;
+  var $ = function (s, el) { return (el || document).querySelector(s); };
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function uid() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2); }
+  function today() { return L.todayISO(); }
+  function safeUrl(u) { return /^https?:\/\//i.test(u || '') ? u : ''; }
+
+  var CATEGORIES = ['Alimentación', 'Mascotas', 'Limpieza', 'Higiene', 'Hogar', 'Bebidas', 'Otros'];
+  var REN_CATS = { seguro: 'Seguro', suscripcion: 'Suscripción', cuota: 'Cuota', prueba: 'Prueba gratuita' };
+  var FREQS = { mensual: 'Mensual', bimestral: 'Bimestral', trimestral: 'Trimestral', semestral: 'Semestral', anual: 'Anual', semanal: 'Semanal', unico: 'Pago único', otro: 'Otra' };
+  var AUTO = { si: 'Sí', no: 'No', desconocida: 'Desconocida' };
+  var UNIT_OPTS = [['g', 'gramos (g)'], ['kg', 'kilos (kg)'], ['ml', 'mililitros (ml)'], ['l', 'litros (l)'], ['ud', 'unidades']];
+
+  // ================= Almacenamiento =================
+  var S = { products: [], stores: [], prices: [], list: [], renewals: [], purchases: [], settings: { warnDays: 7, demoSeeded: false } };
+  var photos = {}; // id -> dataURL
+  var db = null, storageError = null, persisted = null;
+  var ui = { tab: 'hoy', showArchivedP: false, showArchivedR: false, search: '', lastStoreId: null, lastPriceDate: null };
+
+  function openDB() {
+    return new Promise(function (res, rej) {
+      if (!window.indexedDB) return rej(new Error('Este navegador no permite IndexedDB'));
+      var req;
+      try { req = indexedDB.open('casa-al-dia', 1); } catch (e) { return rej(e); }
+      req.onupgradeneeded = function () {
+        var d = req.result;
+        if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
+        if (!d.objectStoreNames.contains('photos')) d.createObjectStore('photos');
+      };
+      req.onsuccess = function () { res(req.result); };
+      req.onerror = function () { rej(req.error || new Error('No se pudo abrir la base de datos')); };
+      req.onblocked = function () { rej(new Error('Base de datos bloqueada por otra pestaña')); };
+    });
+  }
+  function tx(store, mode, fn) {
+    return new Promise(function (res, rej) {
+      var t = db.transaction(store, mode), out;
+      var s = t.objectStore(store);
+      out = fn(s);
+      t.oncomplete = function () { res(out && out.result !== undefined ? out.result : undefined); };
+      t.onerror = function () { rej(t.error); };
+      t.onabort = function () { rej(t.error || new Error('Operación cancelada')); };
+    });
+  }
+  function reportStorage(e) {
+    storageError = (e && e.name === 'QuotaExceededError')
+      ? 'No queda espacio en el almacenamiento del navegador. Exporta un respaldo y borra fotos o datos.'
+      : 'Error al guardar: ' + ((e && e.message) || e) + '. Los últimos cambios podrían no haberse guardado.';
+    renderBanners();
+  }
+  function persist() {
+    var names = Array.prototype.slice.call(arguments);
+    if (!db) return Promise.resolve();
+    return tx('kv', 'readwrite', function (s) {
+      names.forEach(function (n) { s.put(JSON.parse(JSON.stringify(S[n])), n); });
+    }).then(function () { if (storageError) { storageError = null; renderBanners(); } }).catch(reportStorage);
+  }
+  function putPhoto(id, data) {
+    photos[id] = data;
+    if (!db) return Promise.resolve();
+    return tx('photos', 'readwrite', function (s) { s.put(data, id); }).catch(reportStorage);
+  }
+  function delPhoto(id) {
+    if (!id) return Promise.resolve();
+    delete photos[id];
+    if (!db) return Promise.resolve();
+    return tx('photos', 'readwrite', function (s) { s.delete(id); }).catch(reportStorage);
+  }
+  function loadAll() {
+    return tx('kv', 'readonly', function (s) { return s.getAll(); }).then(function () {
+      return Promise.all(['products', 'stores', 'prices', 'list', 'renewals', 'purchases', 'settings'].map(function (k) {
+        return tx('kv', 'readonly', function (s) { return s.get(k); }).then(function (v) { if (v !== undefined) S[k] = v; });
+      }));
+    }).then(function () {
+      return new Promise(function (res, rej) {
+        var t = db.transaction('photos', 'readonly'), st = t.objectStore('photos');
+        var req = st.openCursor();
+        req.onsuccess = function () { var c = req.result; if (c) { photos[c.key] = c.value; c.continue(); } };
+        t.oncomplete = res; t.onerror = function () { rej(t.error); };
+      });
+    });
+  }
+
+  // ================= Utilidades UI =================
+  function toast(msg) {
+    var t = $('#toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toast._t); toast._t = setTimeout(function () { t.classList.remove('show'); }, 2600);
+  }
+  /** Diálogo propio (alert/confirm están bloqueados en algunos entornos). */
+  function ask(message, buttons) {
+    return new Promise(function (res) {
+      var box = $('#dialog-box');
+      box.innerHTML = '<p style="margin-top:0">' + message + '</p><div class="btns">' + buttons.map(function (b, i) {
+        return '<button class="btn ' + (b.cls || '') + '" data-i="' + i + '">' + esc(b.label) + '</button>';
+      }).join('') + '</div>';
+      $('#dialog').hidden = false;
+      box.onclick = function (e) {
+        var b = e.target.closest('button[data-i]'); if (!b) return;
+        $('#dialog').hidden = true; box.onclick = null;
+        res(buttons[+b.dataset.i].value);
+      };
+    });
+  }
+  function confirmDanger(msg, okLabel) {
+    return ask(msg, [{ label: 'Cancelar', value: false }, { label: okLabel || 'Eliminar', value: true, cls: 'danger' }]);
+  }
+  function openSheet(title, html) {
+    var p = $('#sheet-panel');
+    p.innerHTML = '<div class="sheet-head"><h2>' + esc(title) + '</h2><button class="btn" data-act="close-sheet">Cerrar</button></div>' + html;
+    $('#sheet').hidden = false; p.scrollTop = 0;
+    document.body.style.overflow = 'hidden';
+  }
+  function closeSheet() { $('#sheet').hidden = true; $('#sheet-panel').innerHTML = ''; document.body.style.overflow = ''; }
+  function field(label, inner, hint) {
+    return '<div class="field"><label>' + label + inner + '</label>' + (hint ? '<div class="hint">' + hint + '</div>' : '') + '</div>';
+  }
+  function inp(name, value, attrs) { return '<input name="' + name + '" value="' + esc(value == null ? '' : value) + '" ' + (attrs || '') + '>'; }
+  function numInp(name, value, attrs) { return inp(name, value, 'type="text" inputmode="decimal" autocomplete="off" ' + (attrs || '')); }
+  function sel(name, opts, value, attrs) {
+    return '<select name="' + name + '" ' + (attrs || '') + '>' + opts.map(function (o) {
+      return '<option value="' + esc(o[0]) + '"' + (String(o[0]) === String(value) ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+    }).join('') + '</select>';
+  }
+  function numToInput(n) { return Number.isFinite(n) ? String(n).replace('.', ',') : ''; }
+  function formData(form) { var o = {}; new FormData(form).forEach(function (v, k) { o[k] = typeof v === 'string' ? v.trim() : v; }); return o; }
+  function formError(form, msg) { var e = form.querySelector('.form-error'); if (e) { e.textContent = msg; e.scrollIntoView({ block: 'center' }); } }
+  function demoChip(x) { return x && x.demo ? '<span class="chip demo">DEMO</span>' : ''; }
+  function byId(coll, id) { return S[coll].find(function (x) { return x.id === id; }) || null; }
+  function productsMap() { var m = {}; S.products.forEach(function (p) { m[p.id] = p; }); return m; }
+  function storeName(id) { var s = byId('stores', id); return s ? s.name : 'Tienda eliminada'; }
+  function activeProducts() { return S.products.filter(function (p) { return !p.archived; }).sort(function (a, b) { return a.name.localeCompare(b.name, 'es'); }); }
+  function thumb(p, big) {
+    var src = p && p.photoId && photos[p.photoId];
+    if (src) return '<img class="' + (big ? 'photo-big' : 'thumb') + '" src="' + src + '" alt="Foto de ' + esc(p.name) + '">';
+    return big ? '' : '<div class="thumb" aria-hidden="true">' + (p && p.category === 'Mascotas' ? '🐾' : '📦') + '</div>';
+  }
+
+  // ================= Previsión (texto) =================
+  function estimateChip(p) {
+    var e = L.estimate(p, today());
+    if (e.status === 'none') return '<span class="chip">Sin estimación</span>';
+    if (e.status !== 'ok') return '<span class="chip warn">Previsión incompleta</span>';
+    var lvl = L.stockAlert(e, S.settings.warnDays);
+    var cls = lvl === 'out' ? 'danger' : lvl === 'soon' ? 'warn' : 'ok';
+    var txt = e.daysLeft < 0 ? 'Agotado (estimado)' : 'Se acaba ~' + L.formatDate(e.endDate) + ' (' + L.relDays(e.daysLeft) + ')';
+    return '<span class="chip ' + cls + '">' + txt + '</span>';
+  }
+  function estimateBox(p) {
+    var e = L.estimate(p, today());
+    var res = e.reserves ? '<div>Envases de reserva (cerrados): <b>' + e.reserves + '</b></div>' : '';
+    if (e.status === 'none') return '<div class="estimate"><b>Sin estimación.</b> <span class="muted">Puedes configurarla con «Corregir existencias».</span>' + res + '</div>';
+    if (e.status !== 'ok') return '<div class="estimate warn"><b>No se puede estimar.</b> ' + esc(e.reason) + res + '</div>';
+    var lvl = L.stockAlert(e, S.settings.warnDays);
+    var h = '<div class="estimate ' + (lvl === 'out' ? 'danger' : lvl === 'soon' ? 'warn' : '') + '">';
+    h += '<div class="small muted">Estimación (corrígela si no coincide)</div>';
+    h += '<div style="font-size:19px;font-weight:700">' + (e.daysLeft < 0 ? 'Probablemente agotado desde el ' + L.formatDate(e.endDate) : 'Se acaba ~' + L.formatDate(e.endDate)) + '</div>';
+    if (e.daysLeft >= 0) h += '<div>Días restantes estimados: <b>' + e.daysLeft + '</b></div>';
+    if (e.mode === 'qty') {
+      h += '<div>Queda aprox. en el envase abierto: <b>' + e.nowLabel + '</b></div>';
+      if (e.reservesCounted) h += '<div class="small">El envase abierto se acaba ~' + L.formatDate(e.openEnd) + '; la fecha incluye las reservas.</div>';
+    }
+    h += res;
+    if (e.mode === 'days' && e.reserves) h += '<div class="small">En el modo «por días» las reservas no se suman a la fecha: cuando abras una, usa «Empezar envase».</div>';
+    if (e.reserves && e.mode === 'qty' && !e.reservesCounted) h += '<div class="small">Las reservas no se suman porque falta el contenido del envase.</div>';
+    return h + '</div>';
+  }
+
+  // ================= Banners =================
+  function hasDemo() { return L.COLLECTIONS.some(function (c) { return S[c].some(function (x) { return x.demo; }); }); }
+  function renderBanners() {
+    var h = '';
+    if (storageError) h += '<div class="banner error">⚠︎ ' + esc(storageError) + '</div>';
+    if (!db) h += '<div class="banner error">⚠︎ No se puede usar el almacenamiento de este navegador. Los cambios se perderán al cerrar. Prueba en Safari normal (no privado).</div>';
+    if (hasDemo()) h += '<div class="banner">Estás viendo <b>datos de demostración</b> (marcados DEMO). <button class="link-btn" data-act="demo-clear">Borrar demostración</button></div>';
+    $('#banners').innerHTML = h;
+  }
+
+  // ================= HOY =================
+  function collectAlerts() {
+    var t = today(), out = [];
+    S.products.forEach(function (p) {
+      if (p.archived) return;
+      var e = L.estimate(p, t), lvl = L.stockAlert(e, S.settings.warnDays);
+      if (lvl === 'out' || lvl === 'soon') {
+        var sub = 'Agotamiento estimado · ' + L.formatDate(e.endDate) + ' (' + L.relDays(e.daysLeft) + ')';
+        if (e.mode === 'days' && e.reserves) sub += ' · tienes ' + e.reserves + ' de reserva';
+        out.push({ days: e.daysLeft, date: e.endDate, icon: '📦', title: p.name, sub: sub, act: 'product-open', id: p.id, demo: p.demo });
+      }
+    });
+    S.renewals.forEach(function (r) {
+      L.renewalAlerts(r, t).forEach(function (a) {
+        var label = a.kind === 'deadline' ? 'Límite para cancelar o modificar' : 'Cobro' + (Number.isInteger(r.amountCents) ? ' de ' + L.formatMoney(r.amountCents, r.currency) : '');
+        var sub = label + ' · ' + L.formatDate(a.date) + ' (' + L.relDays(a.days) + ')';
+        if (a.kind === 'charge' && a.days < 0) sub += ' · ¿ya se cobró? Actualiza la próxima fecha';
+        if (a.kind === 'deadline' && a.days < 0) sub += ' · revisa el estado';
+        out.push({ days: a.days, date: a.date, icon: a.kind === 'deadline' ? '⏰' : '💳', title: r.name, sub: sub, act: 'renewal-open', id: r.id, demo: r.demo });
+      });
+    });
+    return out.sort(function (a, b) { return a.days - b.days; });
+  }
+  function alertItem(a, cls) {
+    return '<button class="item ' + cls + '" data-act="' + a.act + '" data-id="' + a.id + '"><div style="font-size:24px">' + a.icon + '</div><div class="grow"><div class="title">' + esc(a.title) + ' ' + demoChip(a) + '</div><div class="small muted">' + esc(a.sub) + '</div></div></button>';
+  }
+  function renderHoy() {
+    var t = today();
+    var d = new Intl.DateTimeFormat('es-ES', { timeZone: L.TZ, weekday: 'long', day: 'numeric', month: 'long' }).format(new Date());
+    var h = '<p class="muted small" style="margin:4px 4px 0">' + esc(d.charAt(0).toUpperCase() + d.slice(1)) + ' · Los avisos se ven al abrir la app; no llegan con ella cerrada.</p>';
+    var alerts = collectAlerts();
+    var urgent = alerts.filter(function (a) { return a.days <= 1; });
+    var week = alerts.filter(function (a) { return a.days >= 2 && a.days <= 7; });
+    var later = alerts.filter(function (a) { return a.days > 7; });
+    h += '<div class="section-title">Urgente (vencido, hoy o mañana)</div>';
+    h += urgent.length ? urgent.map(function (a) { return alertItem(a, 'alert-urgent'); }).join('') : '<div class="card empty">Nada urgente. 👍</div>';
+    h += '<div class="section-title">Próximos 7 días</div>';
+    h += week.length ? week.map(function (a) { return alertItem(a, 'alert-soon'); }).join('') : '<div class="card empty">Nada previsto para esta semana.</div>';
+    if (later.length) {
+      h += '<div class="section-title">Más adelante (dentro de tus márgenes de aviso)</div>';
+      h += later.map(function (a) { return alertItem(a, 'alert-later'); }).join('');
+    }
+    // Lista de compra
+    var pending = S.list.filter(function (i) { return !i.bought; });
+    h += '<div class="section-title">En tu lista de compra</div>';
+    if (pending.length) {
+      var pm = productsMap();
+      h += '<button class="item" data-tab="compra"><div style="font-size:24px">🛒</div><div class="grow"><div class="title">' + pending.length + ' artículo' + (pending.length > 1 ? 's' : '') + ' pendiente' + (pending.length > 1 ? 's' : '') + '</div><div class="small muted">' + esc(pending.slice(0, 4).map(function (i) { var p = pm[i.productId]; return p ? p.name : i.name; }).join(', ')) + (pending.length > 4 ? '…' : '') + '</div></div></button>';
+    } else h += '<div class="card empty">La lista está vacía.</div>';
+    // Cancelaciones sin confirmar
+    var req = S.renewals.filter(function (r) { return !r.archived && r.status === 'cancel_solicitada'; });
+    h += '<div class="section-title">Cancelaciones pendientes de confirmar</div>';
+    h += req.length ? req.map(function (r) {
+      return '<button class="item alert-soon" data-act="renewal-open" data-id="' + r.id + '"><div style="font-size:24px">✉︎</div><div class="grow"><div class="title">' + esc(r.name) + ' ' + demoChip(r) + '</div><div class="small muted">Solicitada, aún sin confirmar. Comprueba que te la confirman por escrito.</div></div></button>';
+    }).join('') : '<div class="card empty">Ninguna.</div>';
+    // Datos incompletos
+    var inc = [];
+    S.renewals.forEach(function (r) { if (r.archived) return; var f = L.renewalIncomplete(r); if (f.length) inc.push({ act: 'renewal-open', id: r.id, title: r.name, sub: 'Falta: ' + f.join(', '), demo: r.demo }); });
+    S.products.forEach(function (p) { if (p.archived) return; var e = L.estimate(p, t); if (e.status === 'incomplete' || e.status === 'noUse') inc.push({ act: 'product-open', id: p.id, title: p.name, sub: e.reason, demo: p.demo }); });
+    h += '<div class="section-title">Datos importantes por completar</div>';
+    h += inc.length ? inc.map(function (x) { return '<button class="item" data-act="' + x.act + '" data-id="' + x.id + '"><div style="font-size:24px">✎</div><div class="grow"><div class="title">' + esc(x.title) + ' ' + demoChip(x) + '</div><div class="small muted">' + esc(x.sub) + '</div></div></button>'; }).join('') : '<div class="card empty">Todo completo.</div>';
+    return h;
+  }
+
+  // ================= PRODUCTOS =================
+  function renderProductos() {
+    var q = ui.search.toLowerCase();
+    var list = S.products.filter(function (p) { return !!p.archived === ui.showArchivedP; })
+      .filter(function (p) { return !q || (p.name + ' ' + (p.brand || '') + ' ' + (p.category || '')).toLowerCase().indexOf(q) >= 0; })
+      .sort(function (a, b) {
+        var ea = L.estimate(a, today()), eb = L.estimate(b, today());
+        var da = ea.status === 'ok' ? ea.daysLeft : 1e6, dbb = eb.status === 'ok' ? eb.daysLeft : 1e6;
+        return da - dbb || a.name.localeCompare(b.name, 'es');
+      });
+    var h = '<input type="search" id="search" placeholder="Buscar producto, marca o categoría" value="' + esc(ui.search) + '">';
+    h += '<div class="row" style="justify-content:space-between"><button class="link-btn" data-act="toggle-archived-p">' + (ui.showArchivedP ? '← Ver activos' : 'Ver archivados') + '</button><button class="link-btn" data-act="price-new">＋ Registrar precios</button></div>';
+    if (!list.length) {
+      h += '<div class="card empty">' + (ui.showArchivedP ? 'No hay productos archivados.' : (q ? 'No hay resultados.' : 'Aún no tienes productos.<br><br><button class="btn primary" data-act="product-new">Añadir el primero</button>')) + '</div>';
+    }
+    h += list.map(function (p) {
+      var sub = [p.brand, L.validSize(p.size, p.unit) ? L.sizeLabel(p.size, p.unit) : '', p.category].filter(Boolean).join(' · ');
+      var res = p.stock && p.stock.reserves ? '<span class="chip info">' + p.stock.reserves + ' de reserva</span>' : '';
+      var inList = S.list.some(function (i) { return !i.bought && i.productId === p.id; }) ? '<span class="chip info">En la lista</span>' : '';
+      return '<button class="item" data-act="product-open" data-id="' + p.id + '">' + thumb(p) + '<div class="grow"><div class="title">' + esc(p.name) + ' ' + demoChip(p) + '</div><div class="small muted">' + esc(sub) + '</div><div>' + estimateChip(p) + res + inList + '</div></div></button>';
+    }).join('');
+    return h;
+  }
+  function productDetail(id) {
+    var p = byId('products', id); if (!p) return closeSheet();
+    var h = thumb(p, true);
+    h += '<div class="card"><div class="title" style="font-size:20px;font-weight:700">' + esc(p.name) + ' ' + demoChip(p) + (p.archived ? ' <span class="chip">Archivado</span>' : '') + '</div>';
+    h += '<div class="muted">' + esc([p.brand, p.category].filter(Boolean).join(' · ')) + '</div>';
+    h += '<div>Envase: <b>' + (L.validSize(p.size, p.unit) ? L.sizeLabel(p.size, p.unit) : '<span class="muted">sin indicar</span>') + '</b></div>';
+    if (safeUrl(p.url)) h += '<div><a href="' + esc(p.url) + '" target="_blank" rel="noopener">Abrir enlace de compra ↗</a></div>';
+    h += '</div>';
+    h += '<div class="section-title">Existencias</div>' + estimateBox(p);
+    h += '<div class="btns"><button class="btn" data-act="stock-purchase" data-id="' + p.id + '">Registrar compra</button><button class="btn" data-act="stock-start" data-id="' + p.id + '">Empezar envase</button><button class="btn" data-act="stock-correct" data-id="' + p.id + '">Corregir existencias</button></div>';
+    // Precios
+    var latest = L.latestPrices(S.prices, p.id).sort(function (a, b) {
+      return (L.unitPriceCents(a.priceCents, a.size, a.unit) - L.unitPriceCents(b.priceCents, b.size, b.unit)) || 0;
+    });
+    h += '<div class="section-title">Precios registrados</div><div class="card">';
+    if (!latest.length) h += '<div class="empty">Sin precios. Registrar un precio no significa haberlo comprado.</div>';
+    else {
+      h += '<div class="small muted">Último precio de cada tienda y formato, ordenado por precio unitario.</div><table class="prices"><tr><th>Tienda</th><th>Envase</th><th>Precio</th><th>Fecha</th></tr>';
+      h += latest.map(function (x) {
+        var up = L.unitPriceCents(x.priceCents, x.size, x.unit);
+        return '<tr><td>' + esc(storeName(x.storeId)) + demoChip(x) + '</td><td>' + L.sizeLabel(x.size, x.unit) + '</td><td><b>' + L.formatMoney(x.priceCents) + '</b><br><span class="small muted">' + L.formatMoney(up) + L.unitPriceLabel(x.unit) + '</span>' + (x.note ? '<br><span class="chip warn">Nota: ' + esc(x.note) + '</span>' : '') + '</td><td class="small">' + L.formatDate(x.date) + '</td></tr>';
+      }).join('') + '</table>';
+      if (latest.some(function (x) { return x.note; })) h += '<div class="small muted">Las notas de promoción no se aplican al cálculo.</div>';
+      var all = S.prices.filter(function (x) { return x.productId === p.id; }).sort(function (a, b) { return a.date < b.date ? 1 : -1; });
+      h += '<details><summary>Historial completo (' + all.length + ')</summary>' + all.map(function (x) {
+        return '<div class="line"><span>' + L.formatDate(x.date) + ' · ' + esc(storeName(x.storeId)) + ' · ' + L.sizeLabel(x.size, x.unit) + '<br><b>' + L.formatMoney(x.priceCents) + '</b>' + (x.note ? ' <span class="small muted">(' + esc(x.note) + ')</span>' : '') + '</span><button class="link-btn" style="color:var(--danger)" data-act="price-delete" data-id="' + x.id + '">Borrar</button></div>';
+      }).join('') + '</details>';
+    }
+    h += '</div>';
+    h += '<div class="btns"><button class="btn" data-act="price-new" data-id="' + p.id + '">＋ Añadir precio</button><button class="btn primary" data-act="list-add" data-id="' + p.id + '">Añadir a la compra</button></div>';
+    h += '<div class="btns"><button class="btn" data-act="product-edit" data-id="' + p.id + '">Editar</button><button class="btn" data-act="product-archive" data-id="' + p.id + '">' + (p.archived ? 'Desarchivar' : 'Archivar') + '</button><button class="btn danger" data-act="product-delete" data-id="' + p.id + '">Eliminar</button></div>';
+    openSheet('Producto', h);
+  }
+  function productForm(id) {
+    var p = id ? byId('products', id) : { name: '', brand: '', category: '', size: null, unit: 'kg', url: '' };
+    var cats = CATEGORIES.concat(S.products.map(function (x) { return x.category; })).filter(function (c, i, a) { return c && a.indexOf(c) === i; });
+    var h = '<form data-form="product" data-id="' + (id || '') + '" novalidate>';
+    h += '<div class="field"><span class="label">Foto (opcional)</span><div id="photo-preview">' + (p.photoId && photos[p.photoId] ? '<img class="photo-big" src="' + photos[p.photoId] + '" alt="">' : '') + '</div>';
+    h += '<label class="btn block" style="text-align:center">📷 Hacer foto o elegir de la galería<input type="file" accept="image/*" name="photo" id="photo-input" hidden></label>';
+    h += '<input type="hidden" name="photoAction" value="keep">' + (p.photoId ? '<button type="button" class="link-btn" style="color:var(--danger)" data-act="photo-remove">Quitar foto</button>' : '');
+    h += '<div class="hint">La foto solo acompaña al producto: la app no lee datos de ella. Se reduce de tamaño antes de guardarse.</div></div>';
+    h += field('Nombre *', inp('name', p.name, 'required autocomplete="off" enterkeyhint="next" placeholder="Ej.: Pienso Ginger"'), 'Puedes usar el micrófono del teclado del iPhone para dictar.');
+    h += field('Marca', inp('brand', p.brand, 'autocomplete="off"'));
+    h += field('Categoría', inp('category', p.category, 'list="cats" autocomplete="off" placeholder="Elige o escribe"') + '<datalist id="cats">' + cats.map(function (c) { return '<option value="' + esc(c) + '">'; }).join('') + '</datalist>');
+    h += '<div class="two">' + field('Contenido del envase', numInp('size', numToInput(p.size), 'placeholder="Ej.: 12"')) + field('Unidad', sel('unit', UNIT_OPTS, p.unit)) + '</div>';
+    h += field('Enlace de compra', inp('url', p.url, 'type="url" inputmode="url" autocomplete="off" placeholder="https://…"'));
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">Guardar producto</button></form>';
+    openSheet(id ? 'Editar producto' : 'Nuevo producto', h);
+  }
+  function compressImage(file) {
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () {
+        var max = 1024, w = img.naturalWidth, h = img.naturalHeight, k = Math.min(1, max / Math.max(w, h));
+        var c = document.createElement('canvas'); c.width = Math.round(w * k); c.height = Math.round(h * k);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        res(c.toDataURL('image/jpeg', 0.72));
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('No se pudo leer la imagen')); };
+      img.src = url;
+    });
+  }
+  var pendingPhoto = null;
+  function saveProduct(form) {
+    var f = formData(form), id = form.dataset.id;
+    if (!f.name) return formError(form, 'Escribe el nombre del producto.');
+    var size = f.size ? L.parseNum(f.size) : null;
+    if (f.size && (size === null || size <= 0)) return formError(form, 'El contenido del envase debe ser un número mayor que 0 (ej.: 1,5).');
+    if (f.url && !safeUrl(f.url)) return formError(form, 'El enlace debe empezar por https:// o http://');
+    var p = id ? Object.assign({}, byId('products', id)) : { id: uid(), createdAt: Date.now(), stock: { mode: 'none', reserves: 0 } };
+    Object.assign(p, { name: f.name, brand: f.brand, category: f.category, size: size, unit: f.unit, url: f.url });
+    var ops = [];
+    if (f.photoAction === 'new' && pendingPhoto) {
+      if (p.photoId) ops.push(delPhoto(p.photoId));
+      p.photoId = uid(); ops.push(putPhoto(p.photoId, pendingPhoto));
+    } else if (f.photoAction === 'remove' && p.photoId) { ops.push(delPhoto(p.photoId)); p.photoId = null; }
+    pendingPhoto = null;
+    if (id) S.products = S.products.map(function (x) { return x.id === id ? p : x; }); else S.products.push(p);
+    Promise.all(ops).then(function () { return persist('products'); }).then(function () {
+      toast(id ? 'Producto actualizado' : 'Producto guardado'); render(); productDetail(p.id);
+    });
+  }
+
+  // ---------- Existencias ----------
+  function purchaseForm(id, listItemId, defaultPacks) {
+    var p = byId('products', id);
+    var stores = S.stores.map(function (s) { return [s.id, s.name]; });
+    var h = '<form data-form="purchase" data-id="' + id + '" data-list="' + (listItemId || '') + '" novalidate>';
+    h += '<p>Registrar compra de <b>' + esc(p.name) + '</b>. Los envases se suman como <b>reserva</b>: el envase abierto y su previsión no cambian.</p>';
+    h += '<div class="two">' + field('Envases comprados', inp('packs', defaultPacks || 1, 'type="number" min="1" step="1" inputmode="numeric"')) + field('Fecha', inp('date', today(), 'type="date"')) + '</div>';
+    h += '<label class="check"><input type="checkbox" name="withPrice" id="withPrice"><span>Guardar también el precio pagado</span></label>';
+    h += '<div id="price-extra" hidden>' + (stores.length ? field('Tienda', sel('storeId', stores, ui.lastStoreId)) : '<p class="small muted">Primero crea una tienda en Compra → Tiendas.</p>') + '<div class="two">' + field('Precio por envase (€)', numInp('price', '')) + field('Contenido', numInp('size', numToInput(p.size))) + '</div>' + field('Unidad', sel('unit', UNIT_OPTS, p.unit)) + '</div>';
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">Confirmar compra</button></form>';
+    openSheet('Registrar compra', h);
+  }
+  function savePurchase(form) {
+    if (form.dataset.busy) return; // evita doble envío
+    var f = formData(form), p = byId('products', form.dataset.id);
+    var packs = parseInt(f.packs, 10);
+    if (!Number.isInteger(packs) || packs <= 0 || String(packs) !== f.packs) return formError(form, 'Indica un número entero de envases (1 o más).');
+    if (!L.isISODate(f.date)) return formError(form, 'Indica la fecha de compra.');
+    var price = null;
+    if (f.withPrice) {
+      var pc = L.parseMoney(f.price), sz = L.parseNum(f.size);
+      if (!f.storeId) return formError(form, 'Elige la tienda o desmarca «Guardar también el precio».');
+      if (pc === null) return formError(form, 'Precio no válido (ej.: 12,95).');
+      if (!sz) return formError(form, 'Indica el contenido del envase comprado.');
+      price = { id: uid(), productId: p.id, storeId: f.storeId, priceCents: pc, size: sz, unit: f.unit, date: f.date, note: 'Precio pagado', createdAt: Date.now() };
+    }
+    form.dataset.busy = '1';
+    var purchase = { id: uid(), productId: p.id, packs: packs, date: f.date, listItemId: form.dataset.list || null, createdAt: Date.now() };
+    S.purchases.push(purchase);
+    S.products = S.products.map(function (x) { return x.id === p.id ? L.applyPurchase(x, packs) : x; });
+    var colls = ['products', 'purchases'];
+    if (price) { S.prices.push(price); colls.push('prices'); }
+    if (purchase.listItemId) {
+      S.list = S.list.map(function (i) { return i.id === purchase.listItemId ? Object.assign({}, i, { bought: true, boughtAt: f.date, purchaseId: purchase.id }) : i; });
+      colls.push('list');
+    }
+    persist.apply(null, colls).then(function () { toast('Compra registrada: +' + packs + ' de reserva'); render(); productDetail(p.id); });
+  }
+  function startForm(id) {
+    var p = byId('products', id), s = p.stock || {};
+    if (s.mode !== 'qty' && s.mode !== 'days') {
+      return ask('Este producto no tiene previsión configurada. Configúrala en «Corregir existencias».', [{ label: 'Entendido', value: 0 }, { label: 'Configurar', value: 1, cls: 'primary' }])
+        .then(function (v) { if (v) stockForm(id); });
+    }
+    if (s.mode === 'qty' && !L.validSize(p.size, p.unit)) {
+      return ask('Para empezar un envase en modo cantidad, indica antes el contenido del envase (Editar).', [{ label: 'Entendido', value: 0 }]);
+    }
+    var h = '<form data-form="start" data-id="' + id + '" novalidate><p>Empiezas hoy un envase nuevo de <b>' + esc(p.name) + '</b>. La previsión del envase abierto se reinicia desde hoy.</p>';
+    if (s.reserves > 0) h += '<label class="check"><input type="checkbox" name="fromReserve" checked><span>Lo saco de mis envases de reserva (tengo ' + s.reserves + ')</span></label>';
+    if (s.mode === 'qty') h += '<p class="small muted">Cantidad del nuevo envase: ' + L.sizeLabel(p.size, p.unit) + '. Consumo diario: se mantiene.</p>';
+    else h += field('¿Cuántos días te durará?', inp('days', Number.isFinite(s.days) ? s.days : '', 'type="number" min="0" step="1" inputmode="numeric"'));
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">Empezar envase hoy</button></form>';
+    openSheet('Empezar envase', h);
+  }
+  function saveStart(form) {
+    var f = formData(form), p = byId('products', form.dataset.id), opts = { fromReserve: !!f.fromReserve };
+    if (p.stock.mode === 'days') {
+      var d = parseInt(f.days, 10);
+      if (!Number.isInteger(d) || d < 0) return formError(form, 'Indica cuántos días te durará (número entero).');
+      opts.days = d;
+    }
+    try {
+      var np = L.startPack(p, today(), opts);
+      S.products = S.products.map(function (x) { return x.id === p.id ? np : x; });
+    } catch (e) { return formError(form, e.message); }
+    persist('products').then(function () { toast('Envase empezado'); render(); productDetail(p.id); });
+  }
+  function stockForm(id) {
+    var p = byId('products', id), s = Object.assign({ mode: 'none', reserves: 0 }, p.stock);
+    var mode = s.mode || 'none';
+    var h = '<form data-form="stock" data-id="' + id + '" novalidate>';
+    h += '<div class="label" style="font-weight:600">¿Cómo quieres estimar la duración?</div><div class="seg">' + [['none', 'Sin estimación'], ['qty', 'Cantidad y consumo'], ['days', 'Por días']].map(function (o) {
+      return '<label><input type="radio" name="mode" value="' + o[0] + '"' + (mode === o[0] ? ' checked' : '') + '>' + o[1] + '</label>';
+    }).join('') + '</div>';
+    h += '<div data-mode="qty"' + (mode === 'qty' ? '' : ' hidden') + '>';
+    h += '<div class="two">' + field('Me queda (envase abierto)', numInp('remaining', numToInput(s.remaining))) + field('Unidad', sel('remUnit', UNIT_OPTS, s.remUnit || p.unit)) + '</div>';
+    h += '<div class="two">' + field('Consumo al día', numInp('daily', numToInput(s.daily))) + field('Unidad', sel('useUnit', UNIT_OPTS, s.useUnit || (p.unit === 'kg' ? 'g' : p.unit === 'l' ? 'ml' : p.unit))) + '</div>';
+    h += field('Medido el día', inp('asOf', s.asOf || today(), 'type="date"'), 'Ej.: Ginger come 300 g al día y quedan 3 kg en el saco abierto.') + '</div>';
+    h += '<div data-mode="days"' + (mode === 'days' ? '' : ' hidden') + '>';
+    h += '<div class="two">' + field('Lo que tengo me dura (días)', inp('days', Number.isFinite(s.days) ? s.days : '', 'type="number" min="0" step="1" inputmode="numeric"')) + field('Desde', inp('from', s.from || today(), 'type="date"')) + '</div></div>';
+    h += field('Envases de reserva (cerrados)', inp('reserves', s.reserves || 0, 'type="number" min="0" step="1" inputmode="numeric"'), 'Corregir existencias no registra ninguna compra.');
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">Guardar existencias</button></form>';
+    openSheet('Corregir existencias', h);
+  }
+  function saveStock(form) {
+    var f = formData(form), p = byId('products', form.dataset.id);
+    var reserves = parseInt(f.reserves || '0', 10);
+    if (!Number.isInteger(reserves) || reserves < 0) return formError(form, 'Las reservas deben ser un número entero (0 o más).');
+    var s = Object.assign({}, p.stock, { mode: f.mode, reserves: reserves });
+    if (f.mode === 'qty') {
+      var rem = L.parseNum(f.remaining), daily = L.parseNum(f.daily);
+      if (rem === null) return formError(form, 'Indica cuánto queda (0 o más).');
+      if (daily === null) return formError(form, 'Indica el consumo diario (0 o más).');
+      if (!L.compatible(f.remUnit, f.useUnit)) return formError(form, 'Las unidades no son compatibles (ej.: no se pueden mezclar gramos y litros).');
+      if (!L.isISODate(f.asOf)) return formError(form, 'Indica la fecha de la medida.');
+      Object.assign(s, { remaining: rem, remUnit: f.remUnit, daily: daily, useUnit: f.useUnit, asOf: f.asOf });
+    } else if (f.mode === 'days') {
+      var d = parseInt(f.days, 10);
+      if (!Number.isInteger(d) || d < 0) return formError(form, 'Indica los días como número entero (0 o más).');
+      if (!L.isISODate(f.from)) return formError(form, 'Indica desde qué fecha.');
+      Object.assign(s, { days: d, from: f.from });
+    }
+    S.products = S.products.map(function (x) { return x.id === p.id ? Object.assign({}, x, { stock: s }) : x; });
+    persist('products').then(function () { toast('Existencias guardadas'); render(); productDetail(p.id); });
+  }
+
+  // ================= PRECIOS Y TIENDAS =================
+  function priceForm(productId) {
+    var prods = activeProducts();
+    if (!prods.length) return ask('Primero añade algún producto.', [{ label: 'Entendido', value: 0 }]);
+    var p = productId ? byId('products', productId) : null;
+    var h = '<form data-form="price" novalidate><p class="small muted">Guarda lo que ves en la tienda. Registrar un precio no suma existencias. Al guardar y añadir otro se mantienen la tienda y la fecha.</p>';
+    h += field('Tienda', (S.stores.length ? sel('storeId', S.stores.map(function (s) { return [s.id, s.name]; }).concat([['__new', '＋ Nueva tienda…']]), ui.lastStoreId || S.stores[0].id) : sel('storeId', [['__new', '＋ Nueva tienda…']], '__new')) +
+      '<input name="newStore" placeholder="Nombre de la nueva tienda" style="margin-top:6px"' + (S.stores.length ? ' hidden' : '') + '>');
+    h += field('Producto', sel('productId', [['', 'Elige…']].concat(prods.map(function (x) { return [x.id, x.name + (x.brand ? ' · ' + x.brand : '')]; })), p ? p.id : ''));
+    h += '<div class="two">' + field('Contenido del envase', numInp('size', p ? numToInput(p.size) : '')) + field('Unidad', sel('unit', UNIT_OPTS, p ? p.unit : 'kg')) + '</div>';
+    h += '<div class="two">' + field('Precio del envase (€)', numInp('price', '', 'placeholder="0,00"')) + field('Fecha observada', inp('date', ui.lastPriceDate || today(), 'type="date"')) + '</div>';
+    h += '<div id="unit-preview" class="small muted"></div>';
+    h += field('Nota de promoción (opcional)', inp('note', '', 'autocomplete="off" placeholder="Ej.: 2ª unidad al 50%"'), 'Las promociones se guardan como nota y no se aplican al cálculo.');
+    h += '<div class="form-error"></div><div class="btns"><button class="btn" type="submit" value="close">Guardar</button><button class="btn primary" type="submit" value="again">Guardar y añadir otro</button></div></form>';
+    openSheet('Registrar precio', h);
+  }
+  function updateUnitPreview(form) {
+    var el = form.querySelector('#unit-preview'); if (!el) return;
+    var pc = L.parseMoney(form.price.value), sz = L.parseNum(form.size.value);
+    var up = pc !== null && sz ? L.unitPriceCents(pc, sz, form.unit.value) : null;
+    el.textContent = up !== null ? 'Precio unitario: ' + L.formatMoney(up) + L.unitPriceLabel(form.unit.value) : '';
+  }
+  function savePrice(form, again) {
+    var f = formData(form);
+    var storeId = f.storeId;
+    if (storeId === '__new') {
+      if (!f.newStore) return formError(form, 'Escribe el nombre de la nueva tienda.');
+      var existing = S.stores.find(function (s) { return s.name.toLowerCase() === f.newStore.toLowerCase(); });
+      if (existing) storeId = existing.id;
+      else { storeId = uid(); S.stores.push({ id: storeId, name: f.newStore, createdAt: Date.now() }); }
+    }
+    if (!f.productId) return formError(form, 'Elige el producto.');
+    var size = L.parseNum(f.size);
+    if (!size) return formError(form, 'Indica el contenido del envase (mayor que 0).');
+    var pc = L.parseMoney(f.price);
+    if (pc === null) return formError(form, 'Precio no válido. Usa el formato 12,95');
+    if (!L.isISODate(f.date)) return formError(form, 'Indica la fecha en la que viste el precio.');
+    S.prices.push({ id: uid(), productId: f.productId, storeId: storeId, priceCents: pc, size: size, unit: f.unit, date: f.date, note: f.note, createdAt: Date.now() });
+    ui.lastStoreId = storeId; ui.lastPriceDate = f.date;
+    persist('prices', 'stores').then(function () {
+      toast('Precio guardado en ' + storeName(storeId));
+      render();
+      if (again) priceForm(null); else closeSheet();
+    });
+  }
+  function storesSheet() {
+    var h = '<form data-form="store" novalidate><div class="row">' + '<input name="name" placeholder="Nombre de la tienda" style="flex:1;padding:12px;border:1px solid var(--line);border-radius:12px" autocomplete="off">' + '<button class="btn primary" type="submit">Añadir</button></div><div class="form-error"></div></form>';
+    h += S.stores.length ? S.stores.map(function (s) {
+      var n = S.prices.filter(function (p) { return p.storeId === s.id; }).length;
+      return '<div class="item"><div class="grow"><div class="title">' + esc(s.name) + ' ' + demoChip(s) + '</div><div class="small muted">' + n + ' precio' + (n === 1 ? '' : 's') + ' registrados</div></div><button class="btn danger" data-act="store-delete" data-id="' + s.id + '">Borrar</button></div>';
+    }).join('') : '<div class="card empty">Aún no hay tiendas.</div>';
+    openSheet('Tiendas', h);
+  }
+
+  // ================= COMPRA =================
+  function needLabel(i, p) {
+    if (!Number.isFinite(i.amount) || i.amount <= 0) return 'Cantidad sin indicar';
+    if (i.needType === 'packs') return i.amount + ' envase' + (i.amount === 1 ? '' : 's') + (p && L.validSize(p.size, p.unit) ? ' de ' + L.sizeLabel(p.size, p.unit) : '');
+    return L.fmtNum(i.amount, 3) + ' ' + (L.UNITS[i.unit] ? L.UNITS[i.unit].label : '');
+  }
+  var MISSING_TXT = { manual: 'Artículo manual: sin precios para calcular', noQty: 'Falta la cantidad (o el contenido del envase del producto)', noPrice: 'Sin precios registrados', incompatible: 'Los precios registrados usan unidades incompatibles con la cantidad' };
+  function renderCompra() {
+    var pm = productsMap(), pending = S.list.filter(function (i) { return !i.bought; }), bought = S.list.filter(function (i) { return i.bought; });
+    var h = '<div class="btns" style="margin-top:0"><button class="btn primary" data-act="list-add">＋ Añadir a la lista</button><button class="btn" data-act="price-new">Registrar precios</button><button class="btn" data-act="stores">Tiendas</button></div>';
+    h += '<div class="section-title">Lista (' + pending.length + ')</div>';
+    if (!pending.length) h += '<div class="card empty">No hay nada pendiente. Añade desde aquí o desde la ficha de un producto.</div>';
+    h += pending.map(function (i) {
+      var p = pm[i.productId], r = L.bestOption(i, p, S.prices);
+      var opt = r.status === 'ok'
+        ? '<div class="small">Mejor opción entre tus precios registrados: <b>' + esc(storeName(r.best.price.storeId)) + '</b> · ' + r.best.packs + ' × ' + L.sizeLabel(r.best.price.size, r.best.price.unit) + ' = <b>' + L.formatMoney(r.best.costCents) + '</b><br><span class="muted">Precio del ' + L.formatDate(r.best.price.date) + (r.best.excessBase > 0 ? ' · sobran ~' + L.formatBase(r.best.excessBase, r.best.dim) : '') + '</span></div>'
+        : '<div class="small"><span class="chip warn">' + MISSING_TXT[r.status] + '</span></div>';
+      var link = p && safeUrl(p.url) ? '<a class="btn" href="' + esc(p.url) + '" target="_blank" rel="noopener">Enlace ↗</a>' : '';
+      return '<div class="card"><div class="row"><div class="grow"><div class="title">' + esc(p ? p.name : i.name) + ' ' + demoChip(i) + '</div><div class="muted small">' + esc(needLabel(i, p)) + (i.note ? ' · ' + esc(i.note) : '') + '</div></div></div>' + opt +
+        '<div class="btns"><button class="btn primary" data-act="list-toggle" data-id="' + i.id + '">✓ Comprado</button><button class="btn" data-act="list-edit" data-id="' + i.id + '">Editar</button>' + link + '<button class="btn danger" data-act="list-remove" data-id="' + i.id + '">Quitar</button></div></div>';
+    }).join('');
+    if (pending.length) {
+      var b = L.basket(S.list, pm, S.prices);
+      h += '<div class="section-title">Recomendación por supermercado</div><div class="card">';
+      h += '<div class="small muted">Menor desembolso entre tus precios registrados, comprando envases completos de un mismo formato. No son precios actuales de mercado.</div>';
+      h += b.groups.map(function (g) {
+        return '<div style="margin-top:12px"><b>' + esc(storeName(g.storeId)) + '</b>' + g.lines.map(function (l) {
+          var p = pm[l.item.productId];
+          return '<div class="line small"><span>' + esc(p.name) + ' · ' + l.option.packs + ' × ' + L.sizeLabel(l.option.price.size, l.option.price.unit) + '</span><span>' + L.formatMoney(l.option.costCents) + '</span></div>';
+        }).join('') + '<div class="line"><span>Subtotal</span><b>' + L.formatMoney(g.subtotal) + '</b></div></div>';
+      }).join('');
+      if (!b.groups.length) h += '<div class="empty">Ningún artículo es calculable todavía.</div>';
+      h += '<div class="total"><span>' + (b.partial ? 'Total parcial' : 'Total') + '</span><span>' + L.formatMoney(b.total) + '</span></div>';
+      if (b.partial) h += '<div class="small" style="margin-top:6px"><span class="chip warn">No incluye ' + b.missing.length + ' artículo' + (b.missing.length > 1 ? 's' : '') + '</span> ' + esc(b.missing.map(function (m) { var p = pm[m.item.productId]; return p ? p.name : m.item.name; }).join(', ')) + '</div>';
+      h += '</div>';
+    }
+    if (bought.length) {
+      h += '<details class="card"><summary>Comprados (' + bought.length + ')</summary>' + bought.map(function (i) {
+        var p = pm[i.productId];
+        return '<div class="line"><span>' + esc(p ? p.name : i.name) + (i.purchaseId ? ' <span class="chip ok">sumado a existencias</span>' : '') + '</span><button class="link-btn" data-act="list-untoggle" data-id="' + i.id + '">Desmarcar</button></div>';
+      }).join('') + '<button class="btn block" data-act="list-clear-bought">Vaciar comprados</button></details>';
+    }
+    return h;
+  }
+  function listForm(opts) {
+    opts = opts || {};
+    var i = opts.itemId ? byId('list', opts.itemId) : { productId: opts.productId || '', name: '', needType: 'packs', amount: 1, unit: 'kg', note: '' };
+    var prods = activeProducts();
+    var h = '<form data-form="list" data-id="' + (opts.itemId || '') + '" novalidate>';
+    h += field('Producto', sel('productId', [['', '— Otro (escribir a mano) —']].concat(prods.map(function (p) { return [p.id, p.name + (p.brand ? ' · ' + p.brand : '')]; })), i.productId));
+    h += '<div data-manual' + (i.productId ? ' hidden' : '') + '>' + field('Nombre', inp('name', i.name, 'autocomplete="off" placeholder="Ej.: Pilas AA"')) + '</div>';
+    h += '<div class="label" style="font-weight:600">¿Cuánto necesitas?</div><div class="seg">' + [['packs', 'Nº de envases'], ['qty', 'Cantidad']].map(function (o) {
+      return '<label><input type="radio" name="needType" value="' + o[0] + '"' + (i.needType === o[0] ? ' checked' : '') + '>' + o[1] + '</label>';
+    }).join('') + '</div>';
+    h += '<div class="two">' + field('Cantidad', numInp('amount', numToInput(i.amount))) + '<div data-unit' + (i.needType === 'qty' ? '' : ' hidden') + '>' + field('Unidad', sel('unit', UNIT_OPTS, i.unit || 'kg')) + '</div></div>';
+    h += field('Nota (opcional)', inp('note', i.note, 'autocomplete="off"'));
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">' + (opts.itemId ? 'Guardar cambios' : 'Añadir a la lista') + '</button></form>';
+    openSheet(opts.itemId ? 'Editar artículo' : 'Añadir a la lista', h);
+  }
+  function saveListItem(form) {
+    var f = formData(form), id = form.dataset.id;
+    var amount = f.amount ? L.parseNum(f.amount) : null;
+    if (f.amount && (amount === null || amount <= 0)) return formError(form, 'La cantidad debe ser un número mayor que 0.');
+    if (f.needType === 'packs' && amount !== null && !Number.isInteger(amount)) return formError(form, 'El número de envases debe ser entero.');
+    if (!f.productId && !f.name) return formError(form, 'Elige un producto o escribe un nombre.');
+    var item = { id: id || uid(), productId: f.productId || null, name: f.productId ? '' : f.name, needType: f.needType, amount: amount, unit: f.needType === 'qty' ? f.unit : null, note: f.note, bought: false, createdAt: Date.now() };
+    function done(msg) { persist('list').then(function () { toast(msg); closeSheet(); render(); }); }
+    if (id) { S.list = S.list.map(function (x) { return x.id === id ? Object.assign({}, x, item, { createdAt: x.createdAt }) : x; }); return done('Artículo actualizado'); }
+    var dup = L.findDuplicate(S.list, item);
+    if (!dup) { S.list.push(item); return done('Añadido a la lista'); }
+    var p = item.productId ? byId('products', item.productId) : null;
+    var canSum = dup.needType === item.needType && (dup.unit === item.unit || L.compatible(dup.unit, item.unit) || item.needType === 'packs') && Number.isFinite(dup.amount) && Number.isFinite(amount);
+    var btns = [{ label: 'Cancelar', value: 'cancel' }, { label: 'Sustituir cantidad', value: 'replace', cls: 'primary' }];
+    if (canSum) btns.splice(1, 0, { label: 'Sumar cantidades', value: 'sum' });
+    ask('<b>' + esc(p ? p.name : item.name) + '</b> ya está en la lista (' + esc(needLabel(dup, p)) + '). ¿Qué quieres hacer?', btns).then(function (v) {
+      if (v === 'cancel') return;
+      S.list = S.list.map(function (x) {
+        if (x.id !== dup.id) return x;
+        if (v === 'sum') {
+          var add = item.needType === 'qty' ? L.toBase(amount, item.unit) / L.UNITS[dup.unit].f : amount;
+          return Object.assign({}, x, { amount: Math.round((x.amount + add) * 1000) / 1000 });
+        }
+        return Object.assign({}, x, { needType: item.needType, amount: amount, unit: item.unit, note: item.note || x.note });
+      });
+      done('Cantidad actualizada');
+    });
+  }
+  function toggleBought(id) {
+    var i = byId('list', id), p = i.productId ? byId('products', i.productId) : null;
+    function mark() { S.list = S.list.map(function (x) { return x.id === id ? Object.assign({}, x, { bought: true, boughtAt: today() }) : x; }); persist('list').then(function () { toast('Marcado como comprado'); render(); }); }
+    if (!p || i.purchaseId) return mark();
+    var packs = i.needType === 'packs' && Number.isInteger(i.amount) ? i.amount : 1;
+    ask('¿Quieres sumar esta compra a las existencias de <b>' + esc(p.name) + '</b>? Se añadirán como envases de reserva tras confirmar el número.', [
+      { label: 'Solo marcar', value: 'mark' }, { label: 'Registrar compra', value: 'buy', cls: 'primary' }
+    ]).then(function (v) { if (v === 'buy') purchaseForm(p.id, id, packs); else mark(); });
+  }
+
+  // ================= RENOVACIONES =================
+  function nextKeyDate(r) {
+    var ds = [r.cancelDeadline, r.nextCharge].filter(L.isISODate).sort();
+    return ds[0] || '9999-12-31';
+  }
+  function renewalCard(r) {
+    var t = today();
+    var dl = L.isISODate(r.cancelDeadline) ? L.formatDate(r.cancelDeadline) + ' (' + L.relDays(L.diffDays(t, r.cancelDeadline)) + ')' : '<span class="chip warn">Pendiente de comprobar</span>';
+    var nc = L.isISODate(r.nextCharge) ? L.formatDate(r.nextCharge) + ' (' + L.relDays(L.diffDays(t, r.nextCharge)) + ')' : '<span class="muted">sin fecha</span>';
+    var st = r.status || 'revisar';
+    var stCls = st === 'cancel_confirmada' ? 'ok' : st === 'cancel_solicitada' ? 'warn' : st === 'revisar' ? 'info' : '';
+    var alerts = L.renewalAlerts(r, t);
+    var cls = alerts.some(function (a) { return a.level === 'past' || a.level === 'urgent'; }) ? 'alert-urgent' : alerts.length ? 'alert-soon' : '';
+    return '<button class="item ' + cls + '" data-act="renewal-open" data-id="' + r.id + '"><div class="grow"><div class="title">' + esc(r.name) + ' ' + demoChip(r) + '</div>' +
+      '<div class="small muted">' + esc([r.provider, REN_CATS[r.category]].filter(Boolean).join(' · ')) + (Number.isInteger(r.amountCents) ? ' · ' + L.formatMoney(r.amountCents, r.currency) + ' ' + (FREQS[r.frequency] || '').toLowerCase() : '') + '</div>' +
+      '<div class="small">Próximo cobro: ' + nc + '</div><div class="small">Límite para cancelar: ' + dl + '</div>' +
+      '<div><span class="chip ' + stCls + '">' + L.STATUSES[st] + '</span></div></div></button>';
+  }
+  function renderRenovaciones() {
+    var list = S.renewals.filter(function (r) { return !!r.archived === ui.showArchivedR; }).sort(function (a, b) { return nextKeyDate(a) < nextKeyDate(b) ? -1 : 1; });
+    var annual = 0, counted = 0, unknown = 0;
+    S.renewals.forEach(function (r) {
+      if (r.archived || r.status === 'cancel_confirmada') return;
+      var a = L.annualCostCents(r.amountCents, r.frequency);
+      if (a === null || (r.currency && r.currency !== 'EUR')) unknown++; else { annual += a; counted++; }
+    });
+    var h = '<div class="row" style="justify-content:space-between"><button class="link-btn" data-act="toggle-archived-r">' + (ui.showArchivedR ? '← Ver activas' : 'Ver archivadas') + '</button><button class="link-btn" data-act="ics">📅 Exportar al calendario</button></div>';
+    if (counted) h += '<div class="card small">Coste anual <b>estimado</b> (no son cargos reales): <b>' + L.formatMoney(annual) + '</b> en ' + counted + ' registro' + (counted > 1 ? 's' : '') + (unknown ? '. ' + unknown + ' sin calcular (pago único, otra frecuencia, otra moneda o sin importe).' : '.') + '</div>';
+    if (!list.length) h += '<div class="card empty">' + (ui.showArchivedR ? 'No hay renovaciones archivadas.' : 'Aún no tienes seguros ni suscripciones.<br><br><button class="btn primary" data-act="renewal-new">Añadir la primera</button>') + '</div>';
+    return h + list.map(renewalCard).join('');
+  }
+  function renewalDetail(id) {
+    var r = byId('renewals', id); if (!r) return closeSheet();
+    var t = today();
+    function row(k, v) { return '<div class="line"><span class="muted">' + k + '</span><span style="text-align:right">' + v + '</span></div>'; }
+    var h = '<div class="card"><div class="title" style="font-size:20px;font-weight:700">' + esc(r.name) + ' ' + demoChip(r) + (r.archived ? ' <span class="chip">Archivada</span>' : '') + '</div>';
+    h += row('Proveedor', esc(r.provider || '—')) + row('Categoría', REN_CATS[r.category] || '—');
+    h += row('Importe', Number.isInteger(r.amountCents) ? L.formatMoney(r.amountCents, r.currency) : '—') + row('Frecuencia de cobro', FREQS[r.frequency] || '—');
+    h += row('Próximo cobro', L.isISODate(r.nextCharge) ? L.formatDate(r.nextCharge) + ' (' + L.relDays(L.diffDays(t, r.nextCharge)) + ')' : '—');
+    h += row('Renovación', L.isISODate(r.renewalDate) ? L.formatDate(r.renewalDate) : '—') + row('Renovación automática', AUTO[r.autoRenew] || 'Desconocida');
+    h += row('Límite para cancelar/modificar', L.isISODate(r.cancelDeadline) ? L.formatDate(r.cancelDeadline) + ' (' + L.relDays(L.diffDays(t, r.cancelDeadline)) + ')' : '<span class="chip warn">Pendiente de comprobar</span>');
+    h += row('Avisos en la app', (Number.isInteger(r.alertDeadlineDays) ? r.alertDeadlineDays : 15) + ' días antes del límite · ' + (Number.isInteger(r.alertChargeDays) ? r.alertChargeDays : 3) + ' antes del cobro');
+    if (safeUrl(r.url)) h += '<div style="margin-top:8px"><a href="' + esc(r.url) + '" target="_blank" rel="noopener">Abrir gestión ↗</a></div>';
+    if (r.notes) h += '<div style="margin-top:8px;white-space:pre-wrap">' + esc(r.notes) + '</div>';
+    h += '</div>';
+    if (L.isISODate(r.nextCharge) && r.nextCharge <= t && L.nextChargeDate(r.nextCharge, r.frequency, r.anchorDay)) {
+      h += '<div class="card"><div>La fecha de cobro ya llegó. Si ya se cobró, actualiza la próxima fecha (' + FREQS[r.frequency].toLowerCase() + ').</div><button class="btn block" data-act="renewal-next" data-id="' + r.id + '">Ya se cobró: pasar al ' + L.formatDate(L.nextChargeDate(r.nextCharge, r.frequency, r.anchorDay)) + '</button></div>';
+    }
+    h += '<div class="section-title">Estado (lo cambias tú)</div><div class="card">' + Object.keys(L.STATUSES).map(function (k) {
+      return '<label class="check"><input type="radio" name="st" data-act="renewal-status" data-id="' + r.id + '" value="' + k + '"' + ((r.status || 'revisar') === k ? ' checked' : '') + '><span>' + L.STATUSES[k] + (k === 'cancel_solicitada' ? ' <span class="small muted">(aún no confirmada)</span>' : '') + '</span></label>';
+    }).join('') + '</div>';
+    h += '<div class="btns"><button class="btn" data-act="renewal-edit" data-id="' + r.id + '">Editar</button><button class="btn" data-act="renewal-archive" data-id="' + r.id + '">' + (r.archived ? 'Desarchivar' : 'Archivar') + '</button><button class="btn danger" data-act="renewal-delete" data-id="' + r.id + '">Eliminar</button></div>';
+    openSheet('Renovación', h);
+  }
+  function renewalForm(id) {
+    var r = id ? byId('renewals', id) : { name: '', provider: '', category: 'suscripcion', currency: 'EUR', frequency: 'mensual', autoRenew: 'desconocida', status: 'revisar', alertDeadlineDays: 15, alertChargeDays: 3 };
+    var h = '<form data-form="renewal" data-id="' + (id || '') + '" novalidate>';
+    h += field('Nombre *', inp('name', r.name, 'autocomplete="off" placeholder="Ej.: Seguro del hogar"'));
+    h += '<div class="two">' + field('Proveedor', inp('provider', r.provider, 'autocomplete="off"')) + field('Categoría', sel('category', Object.keys(REN_CATS).map(function (k) { return [k, REN_CATS[k]]; }), r.category)) + '</div>';
+    h += '<div class="two">' + field('Importe', numInp('amount', L.centsToInput(r.amountCents), 'placeholder="0,00"')) + field('Moneda', sel('currency', [['EUR', 'EUR €'], ['USD', 'USD $'], ['GBP', 'GBP £']], r.currency)) + '</div>';
+    h += '<div class="two">' + field('Frecuencia de cobro', sel('frequency', Object.keys(FREQS).map(function (k) { return [k, FREQS[k]]; }), r.frequency)) + field('Próximo cobro', inp('nextCharge', r.nextCharge, 'type="date"')) + '</div>';
+    h += '<div class="two">' + field('Fecha de renovación', inp('renewalDate', r.renewalDate, 'type="date"')) + field('¿Se renueva sola?', sel('autoRenew', Object.keys(AUTO).map(function (k) { return [k, AUTO[k]]; }), r.autoRenew)) + '</div>';
+    h += field('Fecha límite para cancelar o modificar', inp('cancelDeadline', r.cancelDeadline, 'type="date"'), 'Si no la sabes, déjala vacía: aparecerá como «Pendiente de comprobar». La app no la deduce.');
+    h += '<div class="two">' + field('Avisar días antes del límite', inp('alertDeadlineDays', r.alertDeadlineDays, 'type="number" min="0" step="1" inputmode="numeric"')) + field('Avisar días antes del cobro', inp('alertChargeDays', r.alertChargeDays, 'type="number" min="0" step="1" inputmode="numeric"')) + '</div>';
+    h += field('Enlace de gestión', inp('url', r.url, 'type="url" inputmode="url" autocomplete="off" placeholder="https://…"'));
+    h += field('Notas', '<textarea name="notes">' + esc(r.notes || '') + '</textarea>');
+    if (!id) h += field('Estado', sel('status', Object.keys(L.STATUSES).map(function (k) { return [k, L.STATUSES[k]]; }), r.status));
+    h += '<div class="form-error"></div><button class="btn primary block" type="submit">Guardar</button></form>';
+    openSheet(id ? 'Editar renovación' : 'Nueva renovación', h);
+  }
+  function saveRenewal(form) {
+    var f = formData(form), id = form.dataset.id;
+    if (!f.name) return formError(form, 'Escribe el nombre.');
+    var amount = f.amount ? L.parseMoney(f.amount) : null;
+    if (f.amount && amount === null) return formError(form, 'Importe no válido (ej.: 9,99).');
+    if (f.url && !safeUrl(f.url)) return formError(form, 'El enlace debe empezar por https:// o http://');
+    var ad = parseInt(f.alertDeadlineDays, 10), ac = parseInt(f.alertChargeDays, 10);
+    if (!Number.isInteger(ad) || ad < 0 || !Number.isInteger(ac) || ac < 0) return formError(form, 'Los días de aviso deben ser números enteros (0 o más).');
+    var dates = ['nextCharge', 'renewalDate', 'cancelDeadline'];
+    for (var k = 0; k < dates.length; k++) if (f[dates[k]] && !L.isISODate(f[dates[k]])) return formError(form, 'Hay una fecha no válida.');
+    var r = id ? Object.assign({}, byId('renewals', id)) : { id: uid(), createdAt: Date.now(), status: f.status || 'revisar' };
+    Object.assign(r, {
+      name: f.name, provider: f.provider, category: f.category, amountCents: amount, currency: f.currency, frequency: f.frequency,
+      nextCharge: f.nextCharge || null, renewalDate: f.renewalDate || null, autoRenew: f.autoRenew, cancelDeadline: f.cancelDeadline || null,
+      alertDeadlineDays: ad, alertChargeDays: ac, url: f.url, notes: f.notes,
+      anchorDay: f.nextCharge ? Number(f.nextCharge.slice(8, 10)) : null
+    });
+    if (id) S.renewals = S.renewals.map(function (x) { return x.id === id ? r : x; }); else S.renewals.push(r);
+    persist('renewals').then(function () { toast('Guardado'); render(); renewalDetail(r.id); });
+  }
+
+  // ================= Respaldo, demo, calendario =================
+  function saveFile(filename, data, mime) {
+    var useClaude = window.claude && typeof window.claude.use === 'function';
+    var p = useClaude ? window.claude.use('downloads') : Promise.resolve(null);
+    return p.then(function (dl) {
+      if (dl) return dl.save({ filename: filename, data: data }).then(function () { return 'saved'; });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([data], { type: mime }));
+      a.download = filename; document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      return 'saved';
+    });
+  }
+  function settingsSheet() {
+    var inFrame = window.self !== window.top;
+    var h = '<div class="section-title">Avisos de productos</div><div class="card"><form data-form="settings" class="row" novalidate><label class="grow">Avisar cuando falten estos días o menos<input name="warnDays" type="number" min="0" max="120" step="1" inputmode="numeric" value="' + S.settings.warnDays + '" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;margin-top:4px"></label><button class="btn primary" type="submit">Guardar</button></form><div class="form-error"></div></div>';
+    h += '<div class="section-title">Respaldo</div><div class="card">';
+    h += '<p class="small" style="margin-top:0">Tus datos y fotos se guardan <b>solo en este navegador</b> de este dispositivo. No se sincronizan entre Mac e iPhone y se pueden perder si se borran los datos del sitio. Exporta un respaldo con frecuencia (por ejemplo, a iCloud Drive).</p>';
+    h += '<button class="btn primary block" data-act="export">Exportar respaldo (datos + fotos)</button>';
+    h += '<label class="btn block" style="text-align:center">Importar respaldo…<input type="file" accept=".json,application/json" id="import-input" hidden></label>';
+    h += '<p class="small muted">Importar sustituye todos los datos de este dispositivo, previa confirmación.</p></div>';
+    h += '<div class="section-title">Datos de demostración</div><div class="card">' + (hasDemo() ? '<button class="btn block danger" data-act="demo-clear">Borrar solo los datos de demostración</button>' : '<button class="btn block" data-act="demo-load">Cargar datos de demostración</button>') + '<p class="small muted">Solo afecta a registros marcados DEMO; tus registros reales no se tocan.</p></div>';
+    h += '<div class="section-title">Calendario</div><div class="card small">Exportar renovaciones a .ics: ' + (inFrame ? 'dentro de claude.ai la plataforma no permite descargar archivos .ics; usa la versión en archivo del Mac (ver guía).' : 'disponible en Renovaciones → «Exportar al calendario».') + '</div>';
+    h += '<div class="section-title">Estado del almacenamiento</div><div class="card small">' + (db ? 'Base de datos local: activa.' : 'Base de datos local: <b>no disponible</b>.') + ' ' + (persisted === true ? 'El navegador ha concedido almacenamiento persistente.' : persisted === false ? 'El navegador no garantiza conservar los datos: haz respaldos.' : '') + (storageError ? '<br><b style="color:var(--danger)">' + esc(storageError) + '</b>' : '') + '</div>';
+    h += '<div class="section-title">Pendiente (versión B) y futuro</div><div class="card small"><ul class="plain">' +
+      ['Alternativas similares aceptadas por ti (p. ej., detergentes sí, pienso de Ginger no).', 'Optimizar la cesta entre una o dos tiendas, con umbral de ahorro.', 'Promociones calculadas (rebajas, 3x2, tarjeta de socio).', 'Marcar precios antiguos como desactualizados.', 'Renovaciones avanzadas: preaviso, varios avisos, justificantes.', 'Ajustes temporales de consumo (invitados, vacaciones).', 'Futuro: cuenta compartida con Mónica y sincronización, avisos por email/push, tickets, códigos de barras.']
+        .map(function (x) { return '<li>' + x + '</li>'; }).join('') + '</ul></div>';
+    openSheet('Ajustes y respaldo', h);
+  }
+  function exportBackup() {
+    var data = {}; L.COLLECTIONS.forEach(function (c) { data[c] = S[c]; });
+    var obj = { app: 'casa-al-dia', version: 1, exportedAt: new Date().toISOString(), settings: S.settings, data: data, photos: photos };
+    var json = JSON.stringify(obj);
+    saveFile('casa-al-dia-respaldo-' + today() + '.json', json, 'application/json')
+      .then(function () { toast('Respaldo preparado (' + Math.round(json.length / 1024) + ' KB)'); })
+      .catch(function (e) { ask('No se pudo guardar el respaldo: ' + esc((e && (e.message || e.code)) || e) + (e && e.code === 'declined' ? ' (cancelado).' : ''), [{ label: 'Entendido', value: 0 }]); });
+  }
+  function importBackup(file) {
+    var rd = new FileReader();
+    rd.onerror = function () { ask('No se pudo leer el archivo.', [{ label: 'Entendido', value: 0 }]); };
+    rd.onload = function () {
+      var obj;
+      try { obj = JSON.parse(rd.result); } catch (e) { return ask('El archivo no es un respaldo válido (no es JSON).', [{ label: 'Entendido', value: 0 }]); }
+      var v = L.validateBackup(obj);
+      if (!v.ok) return ask('No se puede importar:<ul class="plain">' + v.errors.map(function (e) { return '<li>' + esc(e) + '</li>'; }).join('') + '</ul>No se ha cambiado nada.', [{ label: 'Entendido', value: 0 }]);
+      var c = v.counts;
+      ask('Respaldo válido' + (obj.exportedAt ? ' del ' + esc(L.formatDate(obj.exportedAt.slice(0, 10))) : '') + ': ' + c.products + ' productos, ' + c.prices + ' precios, ' + c.stores + ' tiendas, ' + c.list + ' en la lista, ' + c.renewals + ' renovaciones y ' + c.photos + ' fotos.<br><br><b>Se sustituirán todos los datos actuales de este dispositivo.</b>', [
+        { label: 'Cancelar', value: false }, { label: 'Sustituir mis datos', value: true, cls: 'danger' }
+      ]).then(function (ok) {
+        if (!ok) return;
+        L.COLLECTIONS.forEach(function (k) { S[k] = obj.data[k] || []; });
+        if (obj.settings && Number.isInteger(obj.settings.warnDays)) S.settings.warnDays = obj.settings.warnDays;
+        S.settings.demoSeeded = true;
+        var newPhotos = obj.photos || {};
+        var p = db ? tx('photos', 'readwrite', function (s) { s.clear(); Object.keys(newPhotos).forEach(function (k) { s.put(newPhotos[k], k); }); }) : Promise.resolve();
+        p.then(function () { photos = Object.assign({}, newPhotos); return persist.apply(null, L.COLLECTIONS.concat(['settings'])); })
+          .then(function () { closeSheet(); render(); toast('Respaldo importado'); })
+          .catch(reportStorage);
+      });
+    };
+    rd.readAsText(file);
+  }
+  function exportICS() {
+    var list = S.renewals.filter(function (r) { return !r.archived && r.status !== 'cancel_confirmada' && (L.isISODate(r.cancelDeadline) || L.isISODate(r.nextCharge)); });
+    var inFrame = window.self !== window.top;
+    var h = '<p>Crea un archivo de calendario con ' + list.length + ' renovación' + (list.length === 1 ? '' : 'es') + ': un evento por fecha límite y otro por próximo cobro, con aviso según tus días de antelación (a las 9:00).</p>';
+    h += '<ul class="plain small"><li>Exportar no es sincronizar: si cambias algo en la app, el evento ya importado no cambia.</li><li>Si vuelves a importar, el calendario puede duplicar eventos. Antes, borra los anteriores (buscan «Límite cancelar» o «Cobro:») o impórtalos en un calendario propio («Casa al día») y bórralo entero antes de reimportar.</li><li>Que suene el aviso depende de tu calendario y sus ajustes de notificaciones.</li></ul>';
+    if (inFrame) h += '<div class="form-error">Dentro de claude.ai la plataforma no permite descargar archivos .ics. Abre la versión en archivo de la app en tu Mac para exportarlo y envíatelo al iPhone (AirDrop o correo).</div>';
+    else h += '<button class="btn primary block" data-act="ics-download"' + (list.length ? '' : ' disabled') + '>Descargar .ics</button>';
+    openSheet('Exportar al calendario', h);
+  }
+  function seedDemo() {
+    var t = today(), D = function (n) { return L.addDays(t, n); };
+    var s1 = { id: uid(), name: 'Súper Barrio (demo)', demo: true }, s2 = { id: uid(), name: 'Hiper Afueras (demo)', demo: true };
+    var p1 = { id: uid(), demo: true, name: 'Pienso Ginger (demo)', brand: 'Marca ejemplo', category: 'Mascotas', size: 12, unit: 'kg', url: '', createdAt: Date.now(),
+      stock: { mode: 'qty', remaining: 1.8, remUnit: 'kg', daily: 300, useUnit: 'g', asOf: t, reserves: 0 } };
+    var p2 = { id: uid(), demo: true, name: 'Detergente líquido (demo)', brand: '', category: 'Limpieza', size: 2, unit: 'l', url: '', createdAt: Date.now(),
+      stock: { mode: 'days', days: 25, from: D(-5), reserves: 1 } };
+    var p3 = { id: uid(), demo: true, name: 'Papel higiénico (demo)', brand: '', category: 'Hogar', size: 12, unit: 'ud', url: '', createdAt: Date.now(),
+      stock: { mode: 'qty', remaining: 3, remUnit: 'ud', daily: 0.5, useUnit: 'ud', asOf: t, reserves: 0 } };
+    var p4 = { id: uid(), demo: true, name: 'Gel de ducha (demo)', brand: '', category: 'Higiene', size: 750, unit: 'ml', url: '', createdAt: Date.now(), stock: { mode: 'none', reserves: 0 } };
+    S.stores.push(s1, s2);
+    S.products.push(p1, p2, p3, p4);
+    function pr(p, s, c, size, unit, d, note) { return { id: uid(), demo: true, productId: p.id, storeId: s.id, priceCents: c, size: size, unit: unit, date: d, note: note || '', createdAt: Date.now() }; }
+    S.prices.push(pr(p1, s1, 1499, 3, 'kg', D(-10)), pr(p1, s2, 4290, 12, 'kg', D(-20)), pr(p1, s2, 4490, 12, 'kg', D(-60)),
+      pr(p2, s1, 599, 2, 'l', D(-8), '2ª unidad al 50%'), pr(p2, s2, 899, 3, 'l', D(-20)),
+      pr(p3, s1, 450, 12, 'ud', D(-3)), pr(p3, s2, 790, 24, 'ud', D(-15)));
+    S.list.push({ id: uid(), demo: true, productId: p1.id, needType: 'qty', amount: 5, unit: 'kg', bought: false, note: '', createdAt: Date.now() },
+      { id: uid(), demo: true, productId: p3.id, needType: 'packs', amount: 1, bought: false, note: '', createdAt: Date.now() },
+      { id: uid(), demo: true, productId: null, name: 'Bolsas de basura (demo)', needType: 'packs', amount: 1, bought: false, note: '', createdAt: Date.now() });
+    var nc = D(4);
+    S.renewals.push(
+      { id: uid(), demo: true, name: 'Seguro del hogar (demo)', provider: 'Aseguradora ejemplo', category: 'seguro', amountCents: 2350, currency: 'EUR', frequency: 'mensual', nextCharge: nc, anchorDay: Number(nc.slice(8)), renewalDate: D(40), autoRenew: 'si', cancelDeadline: D(10), alertDeadlineDays: 15, alertChargeDays: 3, url: '', notes: 'Cobro mensual, renovación anual.', status: 'revisar', createdAt: Date.now() },
+      { id: uid(), demo: true, name: 'Plataforma de vídeo (demo)', provider: 'Ejemplo TV', category: 'suscripcion', amountCents: 1299, currency: 'EUR', frequency: 'mensual', nextCharge: D(1), anchorDay: Number(D(1).slice(8)), renewalDate: null, autoRenew: 'si', cancelDeadline: null, alertDeadlineDays: 7, alertChargeDays: 3, url: '', notes: '', status: 'cancel_solicitada', createdAt: Date.now() },
+      { id: uid(), demo: true, name: 'Prueba gratuita app fotos (demo)', provider: 'Ejemplo Apps', category: 'prueba', amountCents: 999, currency: 'EUR', frequency: 'mensual', nextCharge: D(6), anchorDay: Number(D(6).slice(8)), renewalDate: D(6), autoRenew: 'si', cancelDeadline: D(5), alertDeadlineDays: 7, alertChargeDays: 2, url: '', notes: 'Si no cancelo antes, empieza a cobrar.', status: 'revisar', createdAt: Date.now() }
+    );
+    S.settings.demoSeeded = true;
+    return persist.apply(null, L.COLLECTIONS.concat(['settings']));
+  }
+  function clearDemo() {
+    var demoProducts = S.products.filter(function (p) { return p.demo; }).map(function (p) { return p.id; });
+    var demoStores = S.stores.filter(function (s) { return s.demo; }).map(function (s) { return s.id; });
+    var ops = S.products.filter(function (p) { return p.demo && p.photoId; }).map(function (p) { return delPhoto(p.photoId); });
+    S.products = S.products.filter(function (p) { return !p.demo; });
+    S.stores = S.stores.filter(function (s) { return !s.demo; });
+    S.prices = S.prices.filter(function (x) { return !x.demo && demoProducts.indexOf(x.productId) < 0 && demoStores.indexOf(x.storeId) < 0; });
+    S.list = S.list.filter(function (x) { return !x.demo && demoProducts.indexOf(x.productId) < 0; });
+    S.renewals = S.renewals.filter(function (x) { return !x.demo; });
+    S.purchases = S.purchases.filter(function (x) { return !x.demo && demoProducts.indexOf(x.productId) < 0; });
+    return Promise.all(ops).then(function () { return persist.apply(null, L.COLLECTIONS); });
+  }
+
+  // ================= Render y eventos =================
+  var TITLES = { hoy: 'Hoy', productos: 'Productos', compra: 'Compra', renovaciones: 'Renovaciones' };
+  var FAB = { hoy: '＋ Añadir', productos: '＋ Producto', compra: '＋ A la lista', renovaciones: '＋ Renovación' };
+  function render() {
+    $('#title').textContent = TITLES[ui.tab];
+    $('#fab').textContent = FAB[ui.tab];
+    document.querySelectorAll('.tabs button').forEach(function (b) { if (b.dataset.tab === ui.tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
+    var v = ui.tab === 'productos' ? renderProductos() : ui.tab === 'compra' ? renderCompra() : ui.tab === 'renovaciones' ? renderRenovaciones() : renderHoy();
+    $('#view').innerHTML = v;
+    renderBanners();
+  }
+  function go(tab) {
+    if (!TITLES[tab]) tab = 'hoy';
+    ui.tab = tab;
+    try { if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab); } catch (e) { /* algunos marcos no lo permiten */ }
+    render(); window.scrollTo(0, 0);
+  }
+  function update(coll, id, patch) {
+    S[coll] = S[coll].map(function (x) { return x.id === id ? Object.assign({}, x, patch) : x; });
+    return persist(coll);
+  }
+
+  var actions = {
+    'close-sheet': closeSheet,
+    settings: settingsSheet,
+    fab: function () {
+      if (ui.tab === 'productos') return productForm();
+      if (ui.tab === 'compra') return listForm();
+      if (ui.tab === 'renovaciones') return renewalForm();
+      openSheet('Añadir', '<button class="btn primary block" data-act="product-new">📦 Producto</button><button class="btn primary block" data-act="renewal-new">↻ Renovación, seguro o suscripción</button><button class="btn block" data-act="price-new">€ Precio de una tienda</button><button class="btn block" data-act="list-add">🛒 Algo a la lista de compra</button>');
+    },
+    'product-new': function () { productForm(); },
+    'product-open': function (id) { productDetail(id); },
+    'product-edit': function (id) { productForm(id); },
+    'product-archive': function (id) { var p = byId('products', id); update('products', id, { archived: !p.archived }).then(function () { toast(p.archived ? 'Desarchivado' : 'Archivado'); render(); productDetail(id); }); },
+    'product-delete': function (id) {
+      var p = byId('products', id);
+      var n = S.prices.filter(function (x) { return x.productId === id; }).length;
+      confirmDanger('¿Eliminar <b>' + esc(p.name) + '</b>? También se borrarán sus ' + n + ' precios registrados y sus artículos de la lista. Si solo quieres ocultarlo, usa «Archivar».').then(function (ok) {
+        if (!ok) return;
+        S.products = S.products.filter(function (x) { return x.id !== id; });
+        S.prices = S.prices.filter(function (x) { return x.productId !== id; });
+        S.list = S.list.filter(function (x) { return x.productId !== id; });
+        delPhoto(p.photoId).then(function () { return persist('products', 'prices', 'list'); }).then(function () { closeSheet(); render(); toast('Producto eliminado'); });
+      });
+    },
+    'photo-remove': function () { var f = $('form[data-form=product]'); f.photoAction.value = 'remove'; pendingPhoto = null; $('#photo-preview').innerHTML = '<p class="small muted">La foto se quitará al guardar.</p>'; },
+    'stock-purchase': function (id) { purchaseForm(id); },
+    'stock-start': function (id) { startForm(id); },
+    'stock-correct': function (id) { stockForm(id); },
+    'price-new': function (id) { priceForm(id); },
+    'price-delete': function (id) {
+      var x = byId('prices', id), pid = x.productId;
+      confirmDanger('¿Borrar este precio del ' + L.formatDate(x.date) + '?', 'Borrar').then(function (ok) { if (!ok) return; S.prices = S.prices.filter(function (p) { return p.id !== id; }); persist('prices').then(function () { render(); productDetail(pid); }); });
+    },
+    stores: storesSheet,
+    'store-delete': function (id) {
+      var n = S.prices.filter(function (p) { return p.storeId === id; }).length;
+      confirmDanger('¿Borrar la tienda ' + esc(storeName(id)) + (n ? ' y sus ' + n + ' precios' : '') + '?', 'Borrar').then(function (ok) {
+        if (!ok) return;
+        S.stores = S.stores.filter(function (s) { return s.id !== id; }); S.prices = S.prices.filter(function (p) { return p.storeId !== id; });
+        if (ui.lastStoreId === id) ui.lastStoreId = null;
+        persist('stores', 'prices').then(function () { render(); storesSheet(); });
+      });
+    },
+    'list-add': function (id) { listForm({ productId: id }); },
+    'list-edit': function (id) { listForm({ itemId: id }); },
+    'list-remove': function (id) { S.list = S.list.filter(function (x) { return x.id !== id; }); persist('list').then(function () { render(); toast('Quitado de la lista'); }); },
+    'list-toggle': toggleBought,
+    'list-untoggle': function (id) {
+      var i = byId('list', id);
+      update('list', id, { bought: false }).then(function () { render(); toast(i.purchaseId ? 'Desmarcado. La compra ya registrada no se resta: corrige existencias si hace falta.' : 'Desmarcado'); });
+    },
+    'list-clear-bought': function () { S.list = S.list.filter(function (x) { return !x.bought; }); persist('list').then(render); },
+    'renewal-new': function () { renewalForm(); },
+    'renewal-open': function (id) { renewalDetail(id); },
+    'renewal-edit': function (id) { renewalForm(id); },
+    'renewal-archive': function (id) { var r = byId('renewals', id); update('renewals', id, { archived: !r.archived }).then(function () { render(); renewalDetail(id); }); },
+    'renewal-delete': function (id) {
+      confirmDanger('¿Eliminar <b>' + esc(byId('renewals', id).name) + '</b>? Si solo quieres ocultarla, usa «Archivar».').then(function (ok) {
+        if (!ok) return; S.renewals = S.renewals.filter(function (r) { return r.id !== id; }); persist('renewals').then(function () { closeSheet(); render(); });
+      });
+    },
+    'renewal-next': function (id) {
+      var r = byId('renewals', id), n = L.nextChargeDate(r.nextCharge, r.frequency, r.anchorDay);
+      if (!n) return;
+      update('renewals', id, { nextCharge: n }).then(function () { toast('Próximo cobro: ' + L.formatDate(n)); render(); renewalDetail(id); });
+    },
+    'toggle-archived-p': function () { ui.showArchivedP = !ui.showArchivedP; render(); },
+    'toggle-archived-r': function () { ui.showArchivedR = !ui.showArchivedR; render(); },
+    'demo-clear': function () { confirmDanger('¿Borrar todos los datos marcados DEMO? Tus registros reales no se tocan.', 'Borrar demostración').then(function (ok) { if (ok) clearDemo().then(function () { closeSheet(); render(); toast('Demostración borrada'); }); }); },
+    'demo-load': function () { seedDemo().then(function () { closeSheet(); render(); toast('Demostración cargada'); }); },
+    export: exportBackup,
+    ics: exportICS,
+    'ics-download': function () {
+      saveFile('casa-al-dia-renovaciones-' + today() + '.ics', L.buildICS(S.renewals), 'text/calendar')
+        .then(function () { toast('Archivo .ics generado'); })
+        .catch(function (e) { ask('No se pudo generar el archivo: ' + esc((e && (e.message || e.code)) || e), [{ label: 'Entendido', value: 0 }]); });
+    }
+  };
+
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest('[data-tab]');
+    if (t && !t.closest('form')) { closeSheet(); return go(t.dataset.tab); }
+    var a = e.target.closest('[data-act]');
+    if (!a || a.tagName === 'INPUT') return;
+    var fn = actions[a.dataset.act];
+    if (fn) { e.preventDefault(); fn(a.dataset.id); }
+  });
+  $('#sheet').addEventListener('click', function (e) { if (e.target.id === 'sheet') closeSheet(); });
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (t.dataset && t.dataset.act === 'renewal-status') {
+      var id = t.dataset.id, v = t.value;
+      return update('renewals', id, { status: v }).then(function () { toast('Estado: ' + L.STATUSES[v]); render(); });
+    }
+    if (t.id === 'photo-input' && t.files && t.files[0]) {
+      var form = t.form;
+      $('#photo-preview').innerHTML = '<p class="small muted">Reduciendo la foto…</p>';
+      return compressImage(t.files[0]).then(function (data) {
+        pendingPhoto = data; form.photoAction.value = 'new';
+        $('#photo-preview').innerHTML = '<img class="photo-big" src="' + data + '" alt=""><div class="small muted">Foto lista (' + Math.round(data.length * 0.75 / 1024) + ' KB). Se guardará con el producto.</div>';
+      }).catch(function (err) { $('#photo-preview').innerHTML = '<p class="form-error">' + esc(err.message) + '. Puedes guardar el producto sin foto.</p>'; });
+    }
+    if (t.id === 'import-input' && t.files && t.files[0]) { importBackup(t.files[0]); t.value = ''; return; }
+    if (t.id === 'withPrice') { $('#price-extra').hidden = !t.checked; return; }
+    var form2 = t.form;
+    if (!form2) return;
+    if (form2.dataset.form === 'stock' && t.name === 'mode') {
+      form2.querySelectorAll('[data-mode]').forEach(function (d) { d.hidden = d.dataset.mode !== t.value; });
+    }
+    if (form2.dataset.form === 'list') {
+      if (t.name === 'productId') form2.querySelector('[data-manual]').hidden = !!t.value;
+      if (t.name === 'needType') form2.querySelector('[data-unit]').hidden = t.value !== 'qty';
+    }
+    if (form2.dataset.form === 'price') {
+      if (t.name === 'storeId') form2.newStore.hidden = t.value !== '__new';
+      if (t.name === 'productId') { var p = byId('products', t.value); if (p) { form2.size.value = numToInput(p.size); form2.unit.value = p.unit; } }
+      updateUnitPreview(form2);
+    }
+  });
+  document.addEventListener('input', function (e) {
+    if (e.target.id === 'search') { ui.search = e.target.value; var pos = e.target.selectionStart; render(); var s = $('#search'); s.focus(); try { s.setSelectionRange(pos, pos); } catch (x) { /* */ } }
+    if (e.target.form && e.target.form.dataset.form === 'price') updateUnitPreview(e.target.form);
+  });
+  document.addEventListener('submit', function (e) {
+    var form = e.target; e.preventDefault();
+    var k = form.dataset.form;
+    try {
+      if (k === 'product') saveProduct(form);
+      else if (k === 'purchase') savePurchase(form);
+      else if (k === 'start') saveStart(form);
+      else if (k === 'stock') saveStock(form);
+      else if (k === 'price') savePrice(form, e.submitter && e.submitter.value === 'again');
+      else if (k === 'list') saveListItem(form);
+      else if (k === 'renewal') saveRenewal(form);
+      else if (k === 'store') {
+        var n = form.name.value.trim(); if (!n) return formError(form, 'Escribe un nombre.');
+        if (S.stores.some(function (s) { return s.name.toLowerCase() === n.toLowerCase(); })) return formError(form, 'Ya existe una tienda con ese nombre.');
+        S.stores.push({ id: uid(), name: n, createdAt: Date.now() }); persist('stores').then(function () { render(); storesSheet(); });
+      } else if (k === 'settings') {
+        var w = parseInt(form.warnDays.value, 10);
+        if (!Number.isInteger(w) || w < 0 || w > 120) return formError(form.parentNode, 'Indica un número de días entre 0 y 120.');
+        S.settings.warnDays = w; persist('settings').then(function () { toast('Margen de aviso: ' + w + ' días'); render(); });
+      }
+    } catch (err) { formError(form, 'Error inesperado: ' + err.message); }
+  });
+  window.addEventListener('hashchange', function () { var h = location.hash.slice(1); if (TITLES[h] && h !== ui.tab) go(h); });
+
+  // ================= Arranque =================
+  function start() {
+    var h = location.hash.slice(1); if (TITLES[h]) ui.tab = h;
+    openDB().then(function (d) { db = d; return loadAll(); }).catch(function (e) { db = null; storageError = 'Almacenamiento no disponible: ' + (e && e.message ? e.message : e); })
+      .then(function () {
+        var empty = L.COLLECTIONS.every(function (c) { return !S[c].length; });
+        if (empty && !S.settings.demoSeeded) return seedDemo();
+      })
+      .then(function () {
+        if (navigator.storage && navigator.storage.persist) {
+          navigator.storage.persisted().then(function (p) { return p || navigator.storage.persist(); }).then(function (p) { persisted = p; }).catch(function () { /* */ });
+        }
+        render();
+      });
+  }
+  window.__casa = { S: S, photos: photos, L: L }; // para pruebas
+  start();
+})();
