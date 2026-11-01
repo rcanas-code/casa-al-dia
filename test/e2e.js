@@ -58,6 +58,8 @@ function check(name, cond) { results.push((cond ? 'OK   ' : 'FALLO') + ' ' + nam
   await page.click('form[data-form=stock] button[type=submit]');
   await page.waitForSelector('.estimate');
   check('previsión 2,5 kg / 250 g = 10 días', (await page.textContent('.estimate')).includes('Días restantes estimados: 10'));
+  check('la ficha muestra el consumo actual', (await page.textContent('.estimate')).includes('Consumo: 250 g al día'));
+  check('botón renombrado a «Cantidad y consumo»', await page.isVisible('.btns button:has-text("Cantidad y consumo")'));
   // Error de unidades incompatibles
   await page.click('[data-act=stock-correct]');
   await page.selectOption('[name=useUnit]', 'ml');

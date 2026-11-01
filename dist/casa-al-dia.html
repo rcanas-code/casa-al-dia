@@ -717,7 +717,7 @@ ul.plain li { margin: 4px 0; }
   function estimateBox(p) {
     var e = L.estimate(p, today());
     var res = e.reserves ? '<div>Envases de reserva (cerrados): <b>' + e.reserves + '</b></div>' : '';
-    if (e.status === 'none') return '<div class="estimate"><b>Sin estimación.</b> <span class="muted">Puedes configurarla con «Corregir existencias».</span>' + res + '</div>';
+    if (e.status === 'none') return '<div class="estimate"><b>Sin estimación.</b> <span class="muted">Configúrala en «Cantidad y consumo».</span>' + res + '</div>';
     if (e.status !== 'ok') return '<div class="estimate warn"><b>No se puede estimar.</b> ' + esc(e.reason) + res + '</div>';
     var lvl = L.stockAlert(e, S.settings.warnDays);
     var h = '<div class="estimate ' + (lvl === 'out' ? 'danger' : lvl === 'soon' ? 'warn' : '') + '">';
@@ -725,9 +725,12 @@ ul.plain li { margin: 4px 0; }
     h += '<div style="font-size:19px;font-weight:700">' + (e.daysLeft < 0 ? 'Probablemente agotado desde el ' + L.formatDate(e.endDate) : 'Se acaba ~' + L.formatDate(e.endDate)) + '</div>';
     if (e.daysLeft >= 0) h += '<div>Días restantes estimados: <b>' + e.daysLeft + '</b></div>';
     if (e.mode === 'qty') {
+      var st = p.stock;
+      h += '<div>Consumo: <b>' + L.fmtNum(st.daily, 3) + ' ' + L.UNITS[st.useUnit].label + ' al día</b> <button class="link-btn" style="min-height:0;padding:0 4px" data-act="stock-correct" data-id="' + p.id + '">Cambiar</button></div>';
       h += '<div>Queda aprox. en el envase abierto: <b>' + e.nowLabel + '</b></div>';
       if (e.reservesCounted) h += '<div class="small">El envase abierto se acaba ~' + L.formatDate(e.openEnd) + '; la fecha incluye las reservas.</div>';
     }
+    if (e.mode === 'days') h += '<div>Duración indicada: <b>' + p.stock.days + ' días</b> desde el ' + L.formatDate(p.stock.from) + ' <button class="link-btn" style="min-height:0;padding:0 4px" data-act="stock-correct" data-id="' + p.id + '">Cambiar</button></div>';
     h += res;
     if (e.mode === 'days' && e.reserves) h += '<div class="small">En el modo «por días» las reservas no se suman a la fecha: cuando abras una, usa «Empezar envase».</div>';
     if (e.reserves && e.mode === 'qty' && !e.reservesCounted) h += '<div class="small">Las reservas no se suman porque falta el contenido del envase.</div>';
@@ -841,7 +844,7 @@ ul.plain li { margin: 4px 0; }
     if (safeUrl(p.url)) h += '<div><a href="' + esc(p.url) + '" target="_blank" rel="noopener">Abrir enlace de compra ↗</a></div>';
     h += '</div>';
     h += '<div class="section-title">Existencias</div>' + estimateBox(p);
-    h += '<div class="btns"><button class="btn" data-act="stock-purchase" data-id="' + p.id + '">Registrar compra</button><button class="btn" data-act="stock-start" data-id="' + p.id + '">Empezar envase</button><button class="btn" data-act="stock-correct" data-id="' + p.id + '">Corregir existencias</button></div>';
+    h += '<div class="btns"><button class="btn" data-act="stock-purchase" data-id="' + p.id + '">Registrar compra</button><button class="btn" data-act="stock-start" data-id="' + p.id + '">Empezar envase</button><button class="btn" data-act="stock-correct" data-id="' + p.id + '">Cantidad y consumo</button></div>';
     // Precios
     var latest = L.latestPrices(S.prices, p.id).sort(function (a, b) {
       return (L.unitPriceCents(a.priceCents, a.size, a.unit) - L.unitPriceCents(b.priceCents, b.size, b.unit)) || 0;
@@ -1074,7 +1077,7 @@ ul.plain li { margin: 4px 0; }
   function startForm(id) {
     var p = byId('products', id), s = p.stock || {};
     if (s.mode !== 'qty' && s.mode !== 'days') {
-      return ask('Este producto no tiene previsión configurada. Configúrala en «Corregir existencias».', [{ label: 'Entendido', value: 0 }, { label: 'Configurar', value: 1, cls: 'primary' }])
+      return ask('Este producto no tiene previsión configurada. Configúrala en «Cantidad y consumo».', [{ label: 'Entendido', value: 0 }, { label: 'Configurar', value: 1, cls: 'primary' }])
         .then(function (v) { if (v) stockForm(id); });
     }
     if (s.mode === 'qty' && !L.validSize(p.size, p.unit)) {
@@ -1113,9 +1116,9 @@ ul.plain li { margin: 4px 0; }
     h += field('Medido el día', inp('asOf', s.asOf || today(), 'type="date"'), 'Ej.: Ginger come 300 g al día y quedan 3 kg en el saco abierto.') + '</div>';
     h += '<div data-mode="days"' + (mode === 'days' ? '' : ' hidden') + '>';
     h += '<div class="two">' + field('Lo que tengo me dura (días)', inp('days', Number.isFinite(s.days) ? s.days : '', 'type="number" min="0" step="1" inputmode="numeric"')) + field('Desde', inp('from', s.from || today(), 'type="date"')) + '</div></div>';
-    h += field('Envases de reserva (cerrados)', inp('reserves', s.reserves || 0, 'type="number" min="0" step="1" inputmode="numeric"'), 'Corregir existencias no registra ninguna compra.');
+    h += field('Envases de reserva (cerrados)', inp('reserves', s.reserves || 0, 'type="number" min="0" step="1" inputmode="numeric"'), 'Cambiar estos datos no registra ninguna compra.');
     h += '<div class="form-error"></div><button class="btn primary block" type="submit">Guardar existencias</button></form>';
-    openSheet('Corregir existencias', h);
+    openSheet('Cantidad y consumo', h);
   }
   function saveStock(form) {
     var f = formData(form), p = byId('products', form.dataset.id);
@@ -1576,7 +1579,7 @@ ul.plain li { margin: 4px 0; }
     'list-toggle': toggleBought,
     'list-untoggle': function (id) {
       var i = byId('list', id);
-      update('list', id, { bought: false }).then(function () { render(); toast(i.purchaseId ? 'Desmarcado. La compra ya registrada no se resta: corrige existencias si hace falta.' : 'Desmarcado'); });
+      update('list', id, { bought: false }).then(function () { render(); toast(i.purchaseId ? 'Desmarcado. La compra ya registrada no se resta: ajusta «Cantidad y consumo» si hace falta.' : 'Desmarcado'); });
     },
     'list-clear-bought': function () { S.list = S.list.filter(function (x) { return !x.bought; }); persist('list').then(render); },
     'renewal-new': function () { renewalForm(); },

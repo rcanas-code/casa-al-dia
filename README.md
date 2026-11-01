@@ -22,7 +22,7 @@ Web app personal para gestionar productos del hogar, comparar precios entre tus 
   - Previsión por «cantidad y consumo diario» (con conversión g↔kg y ml↔l) o por «me dura X días desde…». También puede no tener estimación.
   - «Registrar compra» suma envases de reserva cerrados y **no** reinicia el envase abierto.
   - «Empezar envase» reinicia la previsión del abierto y, si quieres, gasta una reserva.
-  - «Corregir existencias» cambia los datos sin registrar ninguna compra.
+  - «Cantidad y consumo» cambia lo que queda, el consumo diario y las reservas sin registrar ninguna compra; la ficha muestra el consumo actual con un enlace «Cambiar».
 - **Precios:** historial por tienda y formato con fecha, precio por kg, l o unidad, y modo «Guardar y añadir otro», que mantiene la tienda. Las promociones se guardan como nota y no se calculan.
 - **Compra:**
   - Lista sin duplicados: si repites un artículo, te ofrece sustituir o sumar la cantidad.
