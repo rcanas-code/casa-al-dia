@@ -1225,6 +1225,7 @@ ul.plain li { margin: 4px 0; }
     var p = useClaude ? window.claude.use('downloads') : Promise.resolve(null);
     return p.then(function (dl) {
       if (dl) return dl.save({ filename: filename, data: data }).then(function () { return 'saved'; });
+      if (window.self !== window.top) throw new Error('Este entorno no permite descargar archivos ahora. Prueba a recargar la página');
       var a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([data], { type: mime }));
       a.download = filename; document.body.appendChild(a); a.click();
